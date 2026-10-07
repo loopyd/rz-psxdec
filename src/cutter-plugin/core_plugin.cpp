@@ -26,7 +26,7 @@ void RetDecPlugin::registerDecompilers()
 }
 
 RetDecPlugin::RetDec::RetDec(QObject *parent)
-	: Decompiler("r2retdec", "RetDec", parent)
+	: Decompiler("r2retdec", "rz-psxdec", parent)
 {
 }
 

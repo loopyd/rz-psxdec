@@ -1,94 +1,167 @@
-<img width="150" height="150" align="left" style="float: left; margin: 0 10px 0 0;" alt="rz-retdec logo" src="https://raw.githubusercontent.com/rizinorg/rz-retdec/dev/doc/rz-retdec.svg">
+# rz-psxdec
 
-# rz-retdec
+`rz-psxdec` is a PlayStation 1 focused RetDec plugin for
+[Rizin](https://github.com/rizinorg/rizin). It loads as `rz-psxdec.so` and uses
+the customized [retdec-psx](https://github.com/loopyd/retdec-psx) backend.
 
-RetDec plugin for [Rizin](https://github.com/rizinorg/rizin).
+## Scope
 
-The plugin integrates RetDec decompiler into Rizin console. rz-retdec is shipped with a bundled RetDec version, but you can use your own version (specified below).
+The fork develops decompilation of little-endian, 32-bit PS1 MIPS code for the
+BOF3 reverse-engineering workspace. It keeps ordinary Rizin function commands and
+adds `pdzar` for bounded generation from verified original bytes.
 
-With the bundled version of RetDec you can decompile the following architectures:
-* 32-bit: Intel x86, ARM, MIPS, PIC32, and PowerPC.
-* 64-bit: x86-64, ARM64 (AArch64).
+The two repositories have separate roles:
 
-### Use in Rizin Console
+| Repository | Workspace path | Role |
+| --- | --- | --- |
+| [rz-psxdec](https://github.com/loopyd/rz-psxdec) | `third_party/rz-psxdec` | Rizin plugin and console commands |
+| [retdec-psx](https://github.com/loopyd/retdec-psx) | `third_party/retdec-psx` | Customized RetDec backend linked into the plugin |
 
-In rizin console you can type `pdz?` to print help:
+## Build
 
-```bash
-Usage: pdz   # Native RetDec decompiler plugin.
-| pdz      # Show decompilation result of current function.
-| pdz*     # Show current decompiled function side by side with offsets.
-| pdza[?]  # Run RetDec analysis.
-| pdze     # Show environment variables.
-| pdzj     # Dump current decompiled function as JSON.
-| pdzo     # Show current decompiled function side by side with offsets.
+The supported build described here uses Linux, a C++17 compiler, CMake 3.13 or
+newer, Make, Git, Python 3, Autotools, pkg-config, OpenSSL and zlib. Use an existing
+Rizin installation with its CMake package metadata.
+
+Clone both forks into the same parent directory:
+
+```sh
+git clone --branch dev https://github.com/loopyd/rz-psxdec.git rz-psxdec
+git clone --branch master https://github.com/loopyd/retdec-psx.git retdec-psx
 ```
 
-The following environment variables may be used to dynamically customize the plugin's behavior:
+Prepare disposable source trees from these pinned archives. Verify their SHA-256
+values before extraction:
 
-```bash
-$ export DEC_SAVE_DIR=<path> # custom path for output of decompilation to be saved to.
+| Dependency | Revision | Archive SHA-256 |
+| --- | --- | --- |
+| LLVM | `a776c2a976ef64d9cd84d7ee71d0e4a04aa117a1` | `b5879b30768135e5fce84ccd8be356d2c55c940ab32ceb22d278b228e88c4c60` |
+| Capstone | `5.0-rc2` | `c47acdabb9ba4922a6d68b96eb7e14a431bfef7d7c57cea1e5881f87776228b2` |
+| YARA | `v4.2.0-rc1` | `ae1adad2ae33106f4c296cef32ddba2c93867010ef853028d30cad42548d0474` |
+
+Archive URLs and pins are in the backend's
+[cmake/deps.cmake](https://github.com/loopyd/retdec-psx/blob/master/cmake/deps.cmake).
+Keep executable modes when extracting. YARA's build patches and writes its source
+tree, so use a disposable copy.
+
+Set `rizin_prefix` to the absolute Rizin installation prefix. Set `llvm_source`,
+`capstone_source` and `yara_source` to the absolute extracted source roots. Set
+`stdcxxfs_directory` to the directory containing the selected compiler's
+`libstdc++fs.a`, located with `/usr/bin/c++ -print-file-name=libstdc++fs.a`.
+If the compiler needs no separate filesystem library, omit `CMAKE_LIBRARY_PATH`.
+
+Run these commands from the parent of both clones:
+
+```sh
+build_attempt="$PWD/build/rz-psxdec"
+plugin_revision="$(git -C rz-psxdec rev-parse HEAD)"
+backend_revision="$(git -C retdec-psx rev-parse HEAD)"
+cmake -S rz-psxdec -B "$build_attempt/build" -G "Unix Makefiles" \
+	-DCMAKE_BUILD_TYPE=Release \
+	-DCMAKE_INSTALL_PREFIX="$build_attempt/prefix" \
+	-DCMAKE_C_COMPILER=/usr/bin/cc -DCMAKE_CXX_COMPILER=/usr/bin/c++ \
+	-DCMAKE_MAKE_PROGRAM=/usr/bin/make \
+	-DCMAKE_PREFIX_PATH="$rizin_prefix" \
+	-DCMAKE_LIBRARY_PATH="$stdcxxfs_directory" \
+	-DBUILD_BUNDLED_RETDEC=ON -DBUILD_CUTTER_PLUGIN=OFF \
+	-DRETDEC_ENABLE_ALL=OFF -DRETDEC_ENABLE_RETDEC=ON -DRETDEC_TESTS=OFF \
+	-DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+	-DRETDEC_SOURCE_DIR="$PWD/retdec-psx" \
+	-DRZ_PSXDEC_REVISION="$plugin_revision" \
+	-DRETDEC_PSX_REVISION="$backend_revision" \
+	-DLLVM_LOCAL_DIR="$llvm_source" -DCAPSTONE_LOCAL_DIR="$capstone_source" \
+	-DYARA_LOCAL_DIR="$yara_source"
+cmake --build "$build_attempt/build" --parallel 24 --target rz-psxdec
 ```
 
-## Build and Installation
+The DSO is `$build_attempt/build/src/rz-plugin/rz-psxdec.so`. The local install
+prefix confines RetDec's configure-time support cleanup to this build attempt.
+These commands do not run a top-level install or copy the DSO into an installed
+plugin directory. Keep the DSO with its build dependencies.
 
-This section describes a local build and installation of rz-retdec.
+This fork requires `BUILD_BUNDLED_RETDEC=ON`; it refuses an installed external
+backend. CMake reads both actual Git HEADs and rejects a mismatched explicit
+revision. The generated plugin version is
+`rz-psxdec@<plugin-40-SHA>+retdec-psx@<backend-40-SHA>`. Keep both source trees
+unchanged through the build. The Rizin ABI version remains Rizin's own version.
 
-### Requirements
+In the BOF3 workspace, the existing lifecycle supplies the pinned sources and
+records a verified build receipt:
 
-* A compiler supporting c++17
-* CMake (version >= 3.6)
-* Existing Rizin installation
-* Optional for Cutter: Existing Cutter installation
+```sh
+bin/harness setup --component rz-psxdec --force
+bin/harness doctor --component rz-psxdec
+```
 
-To build the bundled version of RetDec see [RetDec requirements section](https://github.com/avast/retdec#requirements).
+Setup prints the verified DSO and `native-build.json` paths under a fresh
+`build/third_party/rz-psxdec/attempt-*` directory. Its maintained guide is
+`tools/retdec-psx/README.md` in that workspace.
 
-### Process
+## Use
 
-* Clone the repository:
-  * `git clone https://github.com/rizinorg/rz-retdec`
-  * `cd rz-retdec`
-  * `mkdir build && cd build`
-  * `cmake .. -DCMAKE_INSTALL_PREFIX=~/.local`
-  * `make`
-  * `make install`
+Set `rizin_binary` to the Rizin executable from the configured installation.
+Set `dso` to the built `rz-psxdec.so`, or the verified path printed by setup.
+For an extracted raw payload, set `payload` to its file and `load_address` to its
+proven runtime address:
 
-You have to pass the following parameters to `cmake`:
-* `-DCMAKE_INSTALL_PREFIX=<path>` to set the installation path to `<path>`. It is important to set the `<path>` to a location where Rizin can load plugins from (for example `~/.local`).
+```sh
+RZ_NOPLUGINS=1 "$rizin_binary" \
+	-N -n -a mips -b 32 -E little -m "$load_address" \
+	-l "$dso" "$payload"
+```
 
-You can pass the following additional parameters to `cmake`:
-* `-DBUILD_BUNDLED_RETDEC=ON` to build bundled RetDec version with the plugin. The build of the bundled RetDec is by default turned on. RetDec will be installed to `CMAKE_INSTALL_PREFIX`. When turned OFF system is searched for RetDec installation.
-* `-DRZ_RETDEC_DOC=OFF` optional parameter to build Doxygen documentation.
-* `-DBUILD_CUTTER_PLUGIN=OFF` setting to ON will build the Cutter plugin. This requires a cutter installation to be available. If it is not found automatically, you can pass the prefix with `-DCMAKE_PREFIX_PATH=/path/to/cutter/prefix`.
+`RZ_NOPLUGINS=1` disables automatic plugin discovery. `-l` explicitly loads this
+DSO. For a PS-X EXE, extract its payload and use the header's reviewed load address.
+For an overlay, prove its base before mapping it.
 
-*Note*: rz-retdec requires [filesystem](https://en.cppreference.com/w/cpp/filesystem) library to be linked with the plugin. CMake will try to find the library in the system but on GCC 7 it might not be able to do so automatically. In that case you must specify a path where this library is located in the system to the cmake by adding:
-* `-DCMAKE_LIBRARY_PATH=${PATH_TO_FILESTSTEM_DIR}`
+Use `Lcj` to inspect the loaded `rz-psxdec` registration and build version.
+Use `pdz?` and `pdza?` to inspect its commands:
 
-On GCC 7 is `stdc++fs` located in:
-* `-DCMAKE_LIBRARY_PATH=/usr/lib/gcc/x86_64-linux-gnu/7/`
+| Command | Result |
+| --- | --- |
+| `pdz` | Decompile the current Rizin function |
+| `pdzo` | Show decompiled code with offsets |
+| `pdzj` | Print the current decompilation as JSON |
+| `pdz*` | Print commands that add the decompilation as comments |
+| `pdza [start [end]]` | Analyze and import functions in a range |
+| `pdzaa` | Analyze and import all functions |
+| `pdzar /absolute/workspace` | Generate from the fixed original-only workspace request |
+| `pdze` | Show the plugin's output-directory environment setting |
 
-## License
+`DEC_SAVE_DIR` selects the ordinary decompilation output directory. Interactive
+`pdz` uses the current Rizin analysis and supplied context. For original-only
+generation, pass an absolute workspace to `pdzar`. That workspace must contain a
+validated `input/request.json`, `input/image.raw` and the release's fixed
+`native/fixed-config.json`.
 
-rz-retdec Copyright (c) 2022 RizinOrg
+The BOF3 harness prepares those inputs and preserves the generation boundary.
+Its guides are `tools/retdec-psx/preparation.md` and
+`tools/retdec-psx/reconstruction.md`. Ordinary function commands do not establish
+original-only input provenance.
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Lesser General Public License as published by
-the Free Software Foundation, version 3.
+## Evidence limits
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Lesser General Public License for more details.
+Generated C and inferred declarations require independent review. A successful
+plugin invocation, compilation or preservation comparison does not prove original
+bytes, calling contracts, associated data or placement. Full PS1 instruction and
+GTE behavior, runtime fidelity and the 118-function reconstruction milestone remain
+unproved. Held call-contract production retains its separate admission gates.
 
-You should have received a copy of the GNU Lesser General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
+Keep private original images, authored evaluator references and byte-bearing
+captures local. Original-only generation withholds authored answers, names, maps
+and source-specific compiler profiles.
 
-rz-retdec uses third-party libraries or other resources that may be
-distributed under licenses different than this software.
+## Provenance and license
 
-In the event that we accidentally failed to list a required notice,
-please bring it to our attention by contacting the repository owner.
+This fork derives from [rizinorg/rz-retdec](https://github.com/rizinorg/rz-retdec).
+Upstream credits include RizinOrg, copyright 2022, and Avast Software,
+copyright 2020. Plugin source retains `LGPL-3.0-only` notices. See
+[COPYING](COPYING) and the [GNU licenses](https://www.gnu.org/licenses/).
 
-RetDec r2plugin uses the following third-party libraries or other resources:
-1) RetDec: https://github.com/avast/retdec Copyright (c) 2017 Avast Software, MIT license
-2) retdec-r2plugin: https://github.com/avast/retdec-r2plugin Copyright (c) 2020 Avast Software, MIT license
+The backend derives from [Avast RetDec](https://github.com/avast/retdec), copyright
+2017 Avast Software, under the MIT license. The plugin also retains provenance
+from [retdec-r2plugin](https://github.com/avast/retdec-r2plugin), copyright 2020
+Avast Software. Backend and dependency licenses remain separate. See the
+[backend license](https://github.com/loopyd/retdec-psx/blob/master/LICENSE),
+[PeLib notice](https://github.com/loopyd/retdec-psx/blob/master/LICENSE-PELIB) and
+[third-party notices](https://github.com/loopyd/retdec-psx/blob/master/LICENSE-THIRD-PARTY).

@@ -14,6 +14,7 @@
 #include <plugins/CutterPlugin.h>
 
 #include "Decompiler.h"
+#include "rz-plugin/version.h"
 
 class RetDecPlugin : public QObject, CutterPlugin {
     Q_OBJECT
@@ -32,7 +33,7 @@ public:
     void registerDecompilers() override;
 
     QString getName() const override {
-	    return "RetDec Decompiler (rz-retdec)";
+	    return "rz-psxdec";
     }
 
     QString getAuthor() const override {
@@ -40,11 +41,11 @@ public:
     }
 
     QString getDescription() const override {
-	    return "RetDec plugin for Cutter";
+	    return "PlayStation 1 decompilation with retdec-psx";
     }
 
     QString getVersion() const override {
-	    return "0.2";
+	    return RZ_PSXDEC_BUILD_VERSION;
     }
 };
 

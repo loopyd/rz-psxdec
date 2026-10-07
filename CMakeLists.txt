@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.12)
 
-project(rz-retdec C CXX)
+project(rz-psxdec C CXX)
 
 # Minimal required version
 set(CMAKE_CXX_STANDARD 17)
@@ -57,7 +57,7 @@ elseif(UNIX)
         set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
 endif()
 
-option(RZ_RETDEC_DOC "Build rz-retdec documentation" OFF)
+option(RZ_RETDEC_DOC "Build rz-psxdec documentation" OFF)
 if (RZ_RETDEC_DOC)
 	add_subdirectory(doc)
 endif()
@@ -86,8 +86,11 @@ if (RETDEC_INSTALL_PREFIX)
 	endif()
 endif()
 
-option(BUILD_CUTTER_PLUGIN "Build rz-retdec plugin for Cutter" OFF)
-option(BUILD_BUNDLED_RETDEC "Build retdec with the rz-retdec plugin" ON)
+option(BUILD_CUTTER_PLUGIN "Build rz-psxdec plugin for Cutter" OFF)
+option(BUILD_BUNDLED_RETDEC "Build retdec-psx with the rz-psxdec plugin" ON)
+if(NOT BUILD_BUNDLED_RETDEC)
+	message(FATAL_ERROR "rz-psxdec requires the sibling retdec-psx source build")
+endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 

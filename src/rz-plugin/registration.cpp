@@ -12,6 +12,7 @@
 
 #include "rz-plugin/data.h"
 #include "rz-plugin/console/decompiler.h"
+#include "rz-plugin/version.h"
 
 using namespace retdec::rzplugin;
 using namespace retdec::utils::io;
@@ -28,11 +29,11 @@ static bool rz_retdec_fini(RzCore *core, void *)
 
 // Structure containing plugin info.
 RzCorePlugin rz_core_plugin_retdec = {
-	/* .name = */ "rz-retdec",
-	/* .desc = */ "RetDec integration",
+	/* .name = */ "rz-psxdec",
+	/* .desc = */ "PlayStation 1 decompilation with retdec-psx",
 	/* .license = */ "LGPL3",
 	/* .author = */ "RizinOrg and Avast",
-	/* .version = */ nullptr,
+	/* .version = */ RZ_PSXDEC_BUILD_VERSION,
 	/* .init = */ rz_retdec_init,
 	/* .fini = */ rz_retdec_fini,
 };

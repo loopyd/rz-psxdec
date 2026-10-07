@@ -1,0 +1,3 @@
+#pragma once
+
+#define RZ_PSXDEC_BUILD_VERSION "rz-psxdec@@RZ_PSXDEC_GIT_COMMIT@+retdec-psx@@RETDEC_PSX_GIT_COMMIT@"
