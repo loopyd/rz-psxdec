@@ -23,6 +23,15 @@ namespace rzplugin {
 
 static const RzCmdDescArg args_none[] = {{}};
 
+static const RzCmdDescArg args_workspace[] = {
+    with(RzCmdDescArg,
+        $.name = "workspace";
+        $.optional = true;
+        $.type = RZ_CMD_ARG_TYPE_FILE;
+    ),
+    {},
+};
+
 static const RzCmdDescArg args_range[] = {
 	with(RzCmdDescArg,
 		$.name = "start";
@@ -55,6 +64,14 @@ Console::Command DataAnalysisConsole::AnalyzeWholeBinary(
 	analyzeWholeBinary
 );
 
+Console::Command DataAnalysisConsole::RecoverOriginalRange(
+    with(RzCmdDescHelp,
+        $.summary = "Generate from the fixed original-only request in an optional absolute workspace.";
+        $.args = args_workspace
+    ),
+    recoverOriginalRange
+);
+
 DataAnalysisConsole::DataAnalysisConsole(): Console(
 	with(RzCmdDescHelp,
 		$.summary = "Run RetDec analysis.";
@@ -62,7 +79,8 @@ DataAnalysisConsole::DataAnalysisConsole(): Console(
 	),
 	AnalyzeRange,
 	{
-		{"a", AnalyzeWholeBinary}
+		{"a", AnalyzeWholeBinary},
+		{"r", RecoverOriginalRange}
 	})
 {
 }

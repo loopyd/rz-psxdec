@@ -145,6 +145,11 @@ const std::string FormatUtils::convertTypeToLlvm(const RzTypeDB *tdb, const RzTy
 	if (!type || !tdb) {
 		return "void";
 	}
+	if (type->kind == RZ_TYPE_KIND_ARRAY) {
+		auto element = convertTypeToLlvm(tdb, type->array.type);
+		if (element == "void") return "void";
+		return "[" + std::to_string(type->array.count) + " x " + element + "]";
+	}
 	char *typestr = rz_type_as_string(tdb, type);
 	if (!typestr) {
 		return "void";

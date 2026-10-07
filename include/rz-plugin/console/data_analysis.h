@@ -32,6 +32,8 @@ public:
 	/// Representation of pdzaa command.
 	static Console::Command AnalyzeWholeBinary;
 
+	static Console::Command RecoverOriginalRange;
+
 	static const Console *getInstance() { return &console; }
 
 private:
@@ -40,6 +42,9 @@ private:
 
 	/// Implementation of pdzaa command.
 	static RzCmdStatus analyzeWholeBinary(RzCore *core, int argc, const char **argv);
+
+private:
+	static RzCmdStatus recoverOriginalRange(RzCore *core, int argc, const char **argv);
 
 private:
 	/// Singleton.

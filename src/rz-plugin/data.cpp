@@ -7,6 +7,17 @@
  * @brief Information gathering from Rizin and user.
  */
 
+#include <algorithm>
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include <rapidjson/document.h>
+
 #include <retdec/utils/io/log.h>
 
 #include "rz-plugin/data.h"
@@ -17,6 +28,277 @@ using namespace retdec::config;
 using namespace retdec::rzplugin;
 using fu = retdec::rzplugin::FormatUtils;
 using retdec::utils::io::Log;
+
+namespace {
+
+const char* declarationInputVariable = "DEC_OBJECT_DECLARATIONS";
+
+unsigned countPointerLevels(const std::string& spelling)
+{
+	return static_cast<unsigned>(std::count(spelling.begin(), spelling.end(), '*'));
+}
+
+bool spellingCarriesQualifier(const std::string& spelling)
+{
+	for (const char* token : {"volatile", "const", "restrict"})
+	{
+		if (spelling.find(token) != std::string::npos)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool spellingIsBaseAndPointers(const std::string& spelling)
+{
+	std::string base = spelling.substr(0, spelling.find('*'));
+	std::string rest = spelling;
+	rest.erase(std::remove(rest.begin(), rest.end(), '*'), rest.end());
+	auto notSpace = [](char c) { return c != ' ' && c != '\t'; };
+	base.erase(base.begin(), std::find_if(base.begin(), base.end(), notSpace));
+	base.erase(std::find_if(base.rbegin(), base.rend(), notSpace).base(), base.end());
+	rest.erase(rest.begin(), std::find_if(rest.begin(), rest.end(), notSpace));
+	rest.erase(std::find_if(rest.rbegin(), rest.rend(), notSpace).base(), rest.end());
+	return base == rest;
+}
+
+bool parseScalarLlvmType(const std::string& llvmIr, unsigned& width, unsigned& levels)
+{
+	std::string text = llvmIr;
+	text.erase(std::remove_if(text.begin(), text.end(), [](char c) {
+		return c == ' ' || c == '\t'; }), text.end());
+
+	levels = 0;
+	while (!text.empty() && text.back() == '*')
+	{
+		++levels;
+		text.pop_back();
+	}
+	if (levels > 1 || text.size() < 2 || text[0] != 'i')
+	{
+		return false;
+	}
+	const std::string digits = text.substr(1);
+	if (!std::all_of(digits.begin(), digits.end(), [](char c) {
+			return c >= '0' && c <= '9'; }))
+	{
+		return false;
+	}
+	width = static_cast<unsigned>(std::strtoul(digits.c_str(), nullptr, 10));
+	return width >= 8 && width <= 64;
+}
+
+bool validateDeclaredObject(const Object& object, int addressBits, std::string& reason)
+{
+	if (object.getName().empty())
+	{
+		reason = "empty name";
+		return false;
+	}
+	const Address address = object.getStorage().getAddress();
+	if (!object.getStorage().isMemory() || address.isUndefined() || address.getValue() == 0)
+	{
+		reason = "storage is not a defined global address";
+		return false;
+	}
+	if (addressBits > 0 && addressBits < 64 && (address.getValue() >> addressBits) != 0)
+	{
+		reason = "address " + address.toHexPrefixString() + " does not fit the target's "
+				+ std::to_string(addressBits) + "-bit address space";
+		return false;
+	}
+	const Type& type = object.type;
+	if (!type.isDefined())
+	{
+		reason = "missing LLVM type";
+		return false;
+	}
+	if (!type.isVolatile())
+	{
+		reason = "missing object-level qualification";
+		return false;
+	}
+	const std::string& spelling = type.getCType();
+	if (spelling.empty())
+	{
+		reason = "missing C base type";
+		return false;
+	}
+	if (spellingCarriesQualifier(spelling))
+	{
+		reason = "qualifier inside the spelling would qualify the pointee: \"" + spelling + "\"";
+		return false;
+	}
+	if (!spellingIsBaseAndPointers(spelling))
+	{
+		reason = "spelling is not a base type followed by pointer levels: \"" + spelling + "\"";
+		return false;
+	}
+	unsigned width = 0;
+	unsigned levels = 0;
+	if (!parseScalarLlvmType(type.getLlvmIr(), width, levels))
+	{
+		reason = "unsupported LLVM type: \"" + type.getLlvmIr() + "\"";
+		return false;
+	}
+	const unsigned baseWidth = type.getCBaseTypeWidth();
+	if (baseWidth == 0)
+	{
+		reason = "unsupported base type: \"" + spelling + "\"";
+		return false;
+	}
+	if (baseWidth != width)
+	{
+		reason = "base type width " + std::to_string(baseWidth)
+				+ " disagrees with the LLVM type \"" + type.getLlvmIr() + "\"";
+		return false;
+	}
+	if (countPointerLevels(spelling) != levels)
+	{
+		reason = "pointer levels in \"" + spelling + "\" disagree with the LLVM type \""
+				+ type.getLlvmIr() + "\"";
+		return false;
+	}
+	return true;
+}
+
+void mergeDeclaredObjects(
+		Config& config,
+		const Config& supplied,
+		const std::string& path,
+		int addressBits)
+{
+	std::vector<std::string> rejected;
+	std::vector<const Object*> accepted;
+	std::map<std::string, Address> names;
+	std::map<Address, std::string> addresses;
+
+	for (const auto& object : supplied.globals)
+	{
+		const std::string label = object.getName().empty() ? std::string("<unnamed>") : object.getName();
+		std::string reason;
+		if (!validateDeclaredObject(object, addressBits, reason))
+		{
+			rejected.push_back(label + ": " + reason);
+			continue;
+		}
+
+		const Address address = object.getStorage().getAddress();
+		const Object* byName = config.globals.getObjectByName(object.getName());
+		const Object* byAddress = config.globals.getObjectByAddress(address);
+		const auto namedAt = names.find(object.getName());
+		const auto addressedAs = addresses.find(address);
+		if (byName && byName->getStorage().getAddress() != address)
+		{
+			rejected.push_back(label + ": name already declared at "
+					+ byName->getStorage().getAddress().toHexString());
+			continue;
+		}
+		if (byAddress && byAddress->getName() != object.getName())
+		{
+			rejected.push_back(label + ": address already declared as \""
+					+ byAddress->getName() + "\"");
+			continue;
+		}
+		if (namedAt != names.end() && namedAt->second != address)
+		{
+			rejected.push_back(label + ": declared twice with different addresses");
+			continue;
+		}
+		if (addressedAs != addresses.end() && addressedAs->second != object.getName())
+		{
+			rejected.push_back(label + ": address declared as \""
+					+ addressedAs->second + "\" as well");
+			continue;
+		}
+
+		names[object.getName()] = address;
+		addresses[address] = object.getName();
+		accepted.push_back(&object);
+	}
+
+	if (!rejected.empty())
+	{
+		Log::error() << declarationInputVariable << ": rejected \"" << path << "\": "
+				<< rejected.size() << " invalid declaration(s); none applied" << std::endl;
+		for (const auto& item : rejected)
+		{
+			Log::error() << "  " << item << std::endl;
+		}
+		return;
+	}
+
+	for (const Object* object : accepted)
+	{
+		config.globals.insert(*object);
+	}
+	Log::info() << declarationInputVariable << ": applied " << accepted.size()
+			<< " declaration(s) from \"" << path << "\"" << std::endl;
+}
+
+bool documentRepresents(const std::string& text, std::size_t represented, std::string& reason)
+{
+	rapidjson::Document document;
+	document.Parse(text.c_str());
+	if (document.HasParseError())
+	{
+		reason = "is not valid JSON";
+		return false;
+	}
+	if (!document.IsObject() || !document.HasMember("globals"))
+	{
+		return true;
+	}
+	const auto& globals = document["globals"];
+	if (!globals.IsArray())
+	{
+		reason = "\"globals\" is not an array";
+		return false;
+	}
+	if (globals.Size() != represented)
+	{
+		reason = "declares " + std::to_string(globals.Size()) + " global(s), but only "
+				+ std::to_string(represented) + " represent a distinct global object";
+		return false;
+	}
+	return true;
+}
+
+void applyDeclaredObjects(Config& config, int addressBits)
+{
+	const char* path = std::getenv(declarationInputVariable);
+	if (path == nullptr || *path == '\0')
+	{
+		return;
+	}
+	try
+	{
+		std::ifstream stream(path);
+		if (!stream)
+		{
+			throw std::runtime_error("cannot be opened");
+		}
+		const std::string text((std::istreambuf_iterator<char>(stream)),
+				std::istreambuf_iterator<char>());
+		const Config supplied = Config::fromJsonString(text);
+		std::string reason;
+		if (!documentRepresents(text, supplied.globals.size(), reason))
+		{
+			Log::error() << declarationInputVariable << ": rejected \"" << path << "\": "
+					<< reason << std::endl;
+			return;
+		}
+		mergeDeclaredObjects(config, supplied, path, addressBits);
+	}
+	catch (const std::exception& error)
+	{
+		Log::error() << declarationInputVariable << ": rejected \"" << path << "\": "
+				<< error.what() << std::endl;
+	}
+}
+
+}
 
 /**
  * Translation map between tokens representing calling convention type returned
@@ -192,17 +474,13 @@ void RizinDatabase::fetchFunctionsAndGlobals(Config &rzconfig) const
 void RizinDatabase::fetchGlobals(Config &config) const
 {
 	RzBinObject *obj = rz_bin_cur_object(_rzcore.bin);
-	if (obj == nullptr || obj->symbols == nullptr)
-		return;
-
-
 	auto list = rz_analysis_var_global_get_all(_rzcore.analysis);
 
 	GlobalVarContainer globals;
 	FunctionContainer functions;
 
 	void **it;
-	rz_pvector_foreach(obj->symbols, it) {
+	if (obj && obj->symbols) rz_pvector_foreach(obj->symbols, it) {
 		auto sym = reinterpret_cast<RzBinSymbol*>(*it);
 		if (sym == nullptr)
 			continue;
@@ -235,16 +513,25 @@ void RizinDatabase::fetchGlobals(Config &config) const
 	}
 
 	// Searching through all globals
-	for (RzListIter *it = list->head; it; it = rz_list_next(it)) {
+	for (RzListIter *it = list ? list->head : nullptr; it; it = rz_list_next(it)) {
 			auto glob = reinterpret_cast<RzAnalysisVarGlobal*>(rz_list_val(it));
 			if (glob == nullptr)
 				continue;
 
 			Object var(glob->name, Storage::inMemory(glob->addr));
 			var.setRealName(glob->name);
-
+			var.setIsFromDebug(true);
+			if (glob->type) {
+				auto typedb = rz_analysis_get_type_db(_rzcore.analysis);
+				var.type = Type(fu::convertTypeToLlvm(typedb, glob->type));
+				if (char *spelling = rz_type_as_string(typedb, glob->type)) {
+					var.type.setCType(spelling);
+					rz_mem_free(spelling);
+				}
+			}
 			globals.insert(var);
 	}
+	rz_list_free(list);
 
 	// If we found at least one dynamically linked function.
 	if (!functions.empty()) {
@@ -255,6 +542,8 @@ void RizinDatabase::fetchGlobals(Config &config) const
 	}
 
 	config.globals = globals;
+
+	applyDeclaredObjects(config, rz_analysis_get_bits(_rzcore.analysis));
 }
 
 /**
@@ -359,6 +648,10 @@ void RizinDatabase::fetchExtraArgsData(ObjectSequentialContainer &args, RzAnalys
 			Object var(arg->name, Storage::undefined());
 			var.setRealName(arg->name);
 			var.type = Type(fu::convertTypeToLlvm(typedb, arg->orig_c_type));
+			if (char *spelling = rz_type_as_string(typedb, arg->orig_c_type)) {
+				var.type.setCType(spelling);
+				rz_mem_free(spelling);
+			}
 			args.push_back(var);
 		}
 		rz_list_free (list);

@@ -11,6 +11,7 @@ set(SOURCES
 	cgen.cpp
 	console/console.cpp
 	console/data_analysis.cpp
+	console/original_range.cpp
 	console/decompiler.cpp
 	registration.cpp
 )
