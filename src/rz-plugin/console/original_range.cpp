@@ -1,15 +1,19 @@
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
 #include <time.h>
+#include <tuple>
 #include <unistd.h>
+#include <vector>
 
 #include <openssl/sha.h>
 #include <rapidjson/document.h>
@@ -33,6 +37,12 @@ constexpr size_t RANGE_LIMIT = 64 << 10;
 constexpr size_t TOKENS_LIMIT = 8 << 20;
 constexpr size_t INFERRED_LIMIT = 2 << 20;
 constexpr size_t STATUS_LIMIT = 256 << 10;
+constexpr size_t CATALOG_LIMIT = 64 << 10;
+constexpr size_t CATALOG_IMAGE_LIMIT = 128;
+constexpr size_t CATALOG_TOTAL_LIMIT = 64 << 20;
+constexpr size_t BINDINGS_LIMIT = 2 << 20;
+constexpr size_t BINDING_CALL_LIMIT = 4096;
+constexpr size_t BINDING_ALTERNATIVE_LIMIT = 4096;
 constexpr uint64_t ADDRESS_END = uint64_t(1) << 32;
 
 struct Descriptor {
@@ -56,15 +66,23 @@ std::string hexBytes(const std::string& bytes)
     return result;
 }
 
-std::string hash(const std::string& bytes)
+std::string hash(const char *bytes, size_t size)
 {
     std::array<unsigned char, SHA256_DIGEST_LENGTH> digest;
-    SHA256(reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size(), digest.data());
+    SHA256(reinterpret_cast<const unsigned char *>(bytes), size, digest.data());
     return hexBytes(std::string(reinterpret_cast<const char *>(digest.data()), digest.size()));
 }
 
-std::string readFile(const char *path, size_t limit)
+std::string hash(const std::string& bytes)
 {
+    return hash(bytes.data(), bytes.size());
+}
+
+void checkCutoff(double cutoff);
+
+std::string readFile(const char *path, size_t limit, double cutoff = 0)
+{
+    if (cutoff > 0) checkCutoff(cutoff);
     Descriptor file{::open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)};
     require(file.value >= 0, "fixed input cannot be opened");
     struct stat metadata;
@@ -73,13 +91,16 @@ std::string readFile(const char *path, size_t limit)
     std::string bytes(size_t(metadata.st_size), '\0');
     size_t position = 0;
     while (position < bytes.size()) {
-        auto count = ::read(file.value, &bytes[position], bytes.size() - position);
+        if (cutoff > 0) checkCutoff(cutoff);
+        auto span = cutoff > 0 ? std::min<size_t>(bytes.size() - position, 64 << 10) : bytes.size() - position;
+        auto count = ::read(file.value, &bytes[position], span);
         if (count < 0 && errno == EINTR) continue;
         require(count > 0, "fixed input read is incomplete");
         position += size_t(count);
     }
     char extra;
     require(::read(file.value, &extra, 1) == 0, "fixed input grew during read");
+    if (cutoff > 0) checkCutoff(cutoff);
     return bytes;
 }
 
@@ -126,7 +147,7 @@ struct Artifact {
 };
 
 struct Artifacts {
-    Artifact tokens, inferred;
+    Artifact tokens, inferred, bindings;
     bool inferredComputed = false, partialRetention = false;
 };
 
@@ -205,22 +226,30 @@ struct Request {
     double cutoff;
     uint64_t load = 0, payloadBytes = 0, start = 0, end = 0;
     uint64_t invokedStart = 0, invokedEnd = 0;
-    std::string payloadHash, rangeHash;
+    uint64_t fileBytes = 0, payloadOffset = 0;
+    std::string fileHash, payloadHash, rangeHash, catalogHash;
     std::optional<common::OriginalCallScope> scope;
+    std::optional<common::OriginalSourceForm> sourceForm;
 };
 
 Request readRequest(const rapidjson::Document& doc)
 {
     require(doc.IsObject() && doc.HasMember("schema"), "request schema missing");
     auto schema = text(doc["schema"]);
-    bool graph = schema == "retdec118.native-request/v2";
-    if (graph) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees"});
+    bool forms = schema == "retdec118.native-request/v4";
+    bool bindings = forms || schema == "retdec118.native-request/v3";
+    bool graph = bindings || schema == "retdec118.native-request/v2";
+    if (forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form"});
+    else if (bindings) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256"});
+    else if (graph) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees"});
     else fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image"});
     require(graph || schema == "retdec118.native-request/v1", "request schema rejected");
     digest(doc["request_id"]);
     require(digest(doc["config_sha256"]) == CONFIG_SHA, "configuration identity is not this release");
     require(doc["cutoff"].IsNumber() && !doc["cutoff"].IsBool(), "cutoff must be numeric");
     Request request;
+    if (forms) request.sourceForm = common::parseOriginalSourceForm(text(doc["source_form"]));
+    if (bindings) request.catalogHash = digest(doc["image_catalog_sha256"]);
     request.operation = text(doc["operation"]);
     request.cutoff = doc["cutoff"].GetDouble();
     checkCutoff(request.cutoff);
@@ -234,11 +263,11 @@ Request readRequest(const rapidjson::Document& doc)
     fields(member, {"key", "target", "image_id", "start", "end", "range_sha256"});
     fields(image, {"file_sha256", "file_bytes", "payload_sha256", "payload_offset", "payload_bytes", "load_address"});
     text(member["key"]); text(member["target"]); text(member["image_id"]);
-    digest(image["file_sha256"]);
-    auto fileBytes = number(image["file_bytes"], (uint64_t(1) << 40));
-    auto payloadOffset = number(image["payload_offset"], fileBytes);
+    request.fileHash = digest(image["file_sha256"]);
+    request.fileBytes = number(image["file_bytes"], (uint64_t(1) << 40));
+    request.payloadOffset = number(image["payload_offset"], request.fileBytes);
     request.payloadBytes = number(image["payload_bytes"], PAYLOAD_LIMIT);
-    require(request.payloadBytes > 0 && request.payloadBytes <= fileBytes - payloadOffset, "payload file extent invalid");
+    require(request.payloadBytes > 0 && request.payloadBytes <= request.fileBytes - request.payloadOffset, "payload file extent invalid");
     request.load = number(image["load_address"], ADDRESS_END - 1);
     require(request.payloadBytes <= ADDRESS_END - request.load, "payload address overflow");
     request.start = number(member["start"], ADDRESS_END - 1);
@@ -311,6 +340,21 @@ config::Config cleanConfig(const rapidjson::Document& doc)
 
 using Writer = rapidjson::Writer<rapidjson::StringBuffer>;
 
+std::string compactInferredConfiguration(const std::string& generated)
+{
+    try {
+        rapidjson::Document document;
+        document.Parse<rapidjson::kParseFullPrecisionFlag | rapidjson::kParseIterativeFlag>(generated.data(), generated.size());
+        if (document.HasParseError()) return generated;
+        rapidjson::StringBuffer buffer;
+        Writer writer(buffer);
+        if (!document.Accept(writer) || !writer.IsComplete()) return generated;
+        return std::string(buffer.GetString(), buffer.GetSize());
+    } catch (const std::exception&) {
+        return generated;
+    }
+}
+
 void string(Writer& writer, const std::string& value)
 {
     writer.String(value.data(), value.size());
@@ -321,14 +365,306 @@ void range(Writer& writer, uint64_t start, uint64_t end)
     writer.StartObject(); writer.Key("start"); writer.Uint64(start); writer.Key("end"); writer.Uint64(end); writer.EndObject();
 }
 
+struct BindingImage {
+    std::string id, fileHash, payloadHash;
+    uint64_t fileBytes, payloadOffset, payloadBytes, load;
+    std::vector<size_t> members;
+};
+
+struct BindingTarget {
+    std::string target;
+    size_t image;
+};
+
+struct BindingCatalog {
+    std::vector<BindingImage> images;
+    std::vector<BindingTarget> targets;
+    std::vector<common::ReviewedOriginalFunction> members;
+};
+
+bool sameMember(const common::ReviewedOriginalFunction& a, const common::ReviewedOriginalFunction& b)
+{
+    return std::tie(a.key, a.target, a.imageId, a.start, a.end, a.rangeHash)
+        == std::tie(b.key, b.target, b.imageId, b.start, b.end, b.rangeHash);
+}
+
+BindingCatalog readBindingCatalog(const Request& request, const std::string& workspace)
+{
+    auto bytes = readFile((workspace + "/input/image-catalog.json").c_str(), CATALOG_LIMIT, request.cutoff);
+    require(hash(bytes) == request.catalogHash, "original image catalog hash differs");
+    auto doc = parse(bytes);
+    fields(doc, {"schema", "problem_sha256", "images", "targets", "members"});
+    require(text(doc["schema"]) == "retdec118.original-image-catalog/v1", "original image catalog schema rejected");
+    require(request.scope && digest(doc["problem_sha256"]) == request.scope->problemHash, "catalog Problem identity differs");
+    require(doc["images"].IsArray() && !doc["images"].Empty() && doc["images"].Size() <= CATALOG_IMAGE_LIMIT, "catalog image count rejected");
+    require(doc["targets"].IsArray() && !doc["targets"].Empty() && doc["targets"].Size() <= CATALOG_IMAGE_LIMIT, "catalog target count rejected");
+    require(doc["members"].IsArray() && doc["members"].Size() == 118, "catalog member count rejected");
+    BindingCatalog catalog;
+    std::map<std::string, size_t> images, targets, members;
+    uint64_t totalBytes = 0;
+    for (const auto& row : doc["images"].GetArray()) {
+        checkCutoff(request.cutoff);
+        fields(row, {"image_id", "file_sha256", "file_bytes", "payload_offset", "payload_sha256", "payload_bytes", "load_address", "payload_index"});
+        BindingImage image;
+        image.id = text(row["image_id"]); image.fileHash = digest(row["file_sha256"]); image.payloadHash = digest(row["payload_sha256"]);
+        image.fileBytes = number(row["file_bytes"], PAYLOAD_LIMIT);
+        image.payloadOffset = number(row["payload_offset"], image.fileBytes);
+        image.payloadBytes = number(row["payload_bytes"], PAYLOAD_LIMIT);
+        image.load = number(row["load_address"], ADDRESS_END - 1);
+        require(image.payloadBytes > 0 && image.payloadBytes <= image.fileBytes - image.payloadOffset
+            && image.payloadBytes <= ADDRESS_END - image.load, "catalog physical payload extent rejected");
+        require(number(row["payload_index"], CATALOG_IMAGE_LIMIT - 1) == catalog.images.size(), "catalog payload index rejected");
+        require(catalog.images.empty() || catalog.images.back().id < image.id, "catalog image order or identity rejected");
+        auto available = CATALOG_TOTAL_LIMIT - totalBytes;
+        require(image.fileBytes <= available && image.payloadBytes <= available - image.fileBytes, "catalog aggregate bytes rejected");
+        totalBytes += image.fileBytes + image.payloadBytes;
+        images.emplace(image.id, catalog.images.size());
+        catalog.images.push_back(std::move(image));
+    }
+    for (const auto& row : doc["targets"].GetArray()) {
+        fields(row, {"target", "kind", "image_id"});
+        auto target = text(row["target"]), image = text(row["image_id"]);
+        text(row["kind"]);
+        auto found = images.find(image);
+        require(found != images.end(), "catalog target image missing");
+        require(catalog.targets.empty() || catalog.targets.back().target < target, "catalog target order or identity rejected");
+        targets.emplace(target, catalog.targets.size());
+        catalog.targets.push_back({std::move(target), found->second});
+    }
+    std::set<std::tuple<std::string, std::string, uint64_t>> starts;
+    for (const auto& row : doc["members"].GetArray()) {
+        checkCutoff(request.cutoff);
+        fields(row, {"key", "target", "image_id", "start", "end", "range_sha256"});
+        common::ReviewedOriginalFunction member;
+        member.key = text(row["key"]); member.target = text(row["target"]); member.imageId = text(row["image_id"]);
+        member.start = number(row["start"], ADDRESS_END - 1); member.end = number(row["end"], ADDRESS_END);
+        member.rangeHash = digest(row["range_sha256"]);
+        auto found = targets.find(member.target);
+        require(found != targets.end(), "catalog member target missing");
+        auto imageIndex = catalog.targets[found->second].image;
+        auto& image = catalog.images[imageIndex];
+        require(member.imageId == image.id && member.start % 4 == 0 && member.end % 4 == 0
+            && member.start < member.end && member.end - member.start <= RANGE_LIMIT
+            && member.start >= image.load && member.end <= image.load + image.payloadBytes, "catalog member physical extent rejected");
+        require(catalog.members.empty() || catalog.members.back().key < member.key, "catalog member order or identity rejected");
+        require(starts.emplace(member.target, member.imageId, member.start).second, "catalog reviewed entry ambiguous");
+        members.emplace(member.key, catalog.members.size());
+        image.members.push_back(catalog.members.size());
+        catalog.members.push_back(std::move(member));
+    }
+    auto requireMember = [&](const auto& member) {
+        auto found = members.find(member.key);
+        require(found != members.end() && sameMember(catalog.members[found->second], member), "catalog reviewed scope identity differs");
+    };
+    requireMember(request.scope->root);
+    for (const auto& member : request.scope->callees) requireMember(member);
+    return catalog;
+}
+
+struct BindingAlternative {
+    size_t target;
+    uint64_t offset;
+    std::optional<uint32_t> word;
+    std::optional<size_t> member;
+};
+
+struct BindingCall {
+    uint64_t pc;
+    uint32_t word;
+    unsigned link, source;
+    std::optional<uint32_t> address;
+    std::vector<BindingAlternative> alternatives;
+};
+
+struct BindingScan {
+    uint64_t words;
+    std::vector<BindingCall> calls;
+    std::string remaining;
+    void refuse(const char *reason) {
+        if (remaining.empty()) remaining = reason;
+        calls.clear();
+    }
+};
+
+uint32_t fileWord(const char *bytes)
+{
+    uint32_t value = 0;
+    for (unsigned i = 0; i < 4; ++i) value |= uint32_t(static_cast<unsigned char>(bytes[i])) << (i * 8);
+    return value;
+}
+
+BindingScan recoverBindingAlternatives(const BindingCatalog& catalog, const Request& request,
+    const std::string& workspace, const std::string& payload)
+{
+    BindingScan scan{(request.end - request.start) / 4, {}, {}};
+    for (uint64_t pc = request.start; pc < request.end; pc += 4) {
+        if ((pc - request.start) % 512 == 0) checkCutoff(request.cutoff);
+        auto word = fileWord(payload.data() + size_t(pc - request.load));
+        bool direct = word >> 26 == 3;
+        if (!direct && (word & 0xfc1f07ff) != 9) continue;
+        if (!scan.remaining.empty()) continue;
+        if (scan.calls.size() == BINDING_CALL_LIMIT) { scan.refuse("binding-call-count-bound"); continue; }
+        BindingCall call{pc, word, direct ? 31u : (word >> 11) & 31u, (word >> 21) & 31u, {}, {}};
+        if (direct) call.address = (uint32_t(pc + 4) & 0xf0000000u) | ((word & 0x03ffffffu) << 2);
+        scan.calls.push_back(std::move(call));
+    }
+    size_t alternativeCount = 0;
+    bool rootFound = false;
+    for (size_t index = 0; index < catalog.images.size(); ++index) {
+        checkCutoff(request.cutoff);
+        const auto& image = catalog.images[index];
+        auto digits = std::to_string(index);
+        auto path = workspace + "/input/images/" + std::string(3 - digits.size(), '0') + digits + ".image";
+        auto bytes = readFile(path.c_str(), PAYLOAD_LIMIT, request.cutoff);
+        require(bytes.size() == image.fileBytes && hash(bytes) == image.fileHash, "catalog original file identity differs");
+        const char *mapped = bytes.data() + size_t(image.payloadOffset);
+        require(hash(mapped, size_t(image.payloadBytes)) == image.payloadHash, "catalog payload identity differs");
+        if (image.id == request.scope->root.imageId) {
+            require(image.fileHash == request.fileHash && image.fileBytes == request.fileBytes
+                && image.payloadOffset == request.payloadOffset && image.payloadBytes == request.payloadBytes
+                && image.payloadHash == request.payloadHash && image.load == request.load, "catalog root mapping differs");
+            require(payload.size() == image.payloadBytes
+                && std::equal(payload.begin(), payload.end(), mapped), "catalog root original bytes differ");
+            rootFound = true;
+        }
+        for (auto memberIndex : image.members) {
+            checkCutoff(request.cutoff);
+            const auto& member = catalog.members[memberIndex];
+            require(hash(mapped + size_t(member.start - image.load), size_t(member.end - member.start))
+                == member.rangeHash, "catalog reviewed original range hash differs");
+        }
+        if (!scan.remaining.empty()) continue;
+        for (size_t targetIndex = 0; targetIndex < catalog.targets.size(); ++targetIndex) {
+            const auto& target = catalog.targets[targetIndex];
+            if (target.image != index) continue;
+            bool overflow = false;
+            for (auto& call : scan.calls) {
+                checkCutoff(request.cutoff);
+                if (!call.address || *call.address < image.load || *call.address - image.load >= image.payloadBytes) continue;
+                if (alternativeCount == BINDING_ALTERNATIVE_LIMIT) { overflow = true; break; }
+                auto offset = uint64_t(*call.address) - image.load;
+                BindingAlternative alternative{targetIndex, offset, {}, {}};
+                if (image.payloadBytes - offset >= 4) alternative.word = fileWord(mapped + size_t(offset));
+                for (auto memberIndex : image.members) {
+                    const auto& member = catalog.members[memberIndex];
+                    if (member.target == target.target && member.start == *call.address) alternative.member = memberIndex;
+                }
+                call.alternatives.push_back(std::move(alternative));
+                ++alternativeCount;
+            }
+            if (overflow) scan.refuse("binding-alternative-count-bound");
+            if (!scan.remaining.empty()) break;
+        }
+    }
+    require(rootFound, "catalog root image missing");
+    for (auto& call : scan.calls) std::sort(call.alternatives.begin(), call.alternatives.end(), [&](const auto& a, const auto& b) {
+        const auto& at = catalog.targets[a.target]; const auto& bt = catalog.targets[b.target];
+        return std::tie(at.target, catalog.images[at.image].id) < std::tie(bt.target, catalog.images[bt.image].id);
+    });
+    checkCutoff(request.cutoff);
+    return scan;
+}
+
+void bindingFact(Writer& writer, const char *key, const char *reason)
+{
+    writer.Key(key); writer.StartObject(); writer.Key("kind"); writer.String(reason ? "partial" : "complete");
+    writer.Key("remaining"); writer.StartArray(); if (reason) writer.String(reason); writer.EndArray(); writer.EndObject();
+}
+
+void bindingMember(Writer& writer, const common::ReviewedOriginalFunction& member)
+{
+    writer.StartObject(); writer.Key("key"); string(writer, member.key); writer.Key("target"); string(writer, member.target);
+    writer.Key("image_id"); string(writer, member.imageId); writer.Key("start"); writer.Uint64(member.start);
+    writer.Key("end"); writer.Uint64(member.end); writer.Key("range_sha256"); string(writer, member.rangeHash); writer.EndObject();
+}
+
+std::string serializeBindings(const BindingCatalog& catalog, const BindingScan& scan, const Request& request)
+{
+    rapidjson::StringBuffer buffer;
+    Writer writer(buffer);
+    writer.StartObject(); writer.Key("schema"); writer.String("retdec118.original-bindings/v1");
+    writer.Key("request_sha256"); string(writer, request.scope->requestHash);
+    writer.Key("problem_sha256"); string(writer, request.scope->problemHash);
+    writer.Key("image_catalog_sha256"); string(writer, request.catalogHash);
+    writer.Key("root"); bindingMember(writer, request.scope->root);
+    writer.Key("scan"); writer.StartObject(); writer.Key("kind"); writer.String(scan.remaining.empty() ? "complete" : "partial");
+    if (!scan.remaining.empty()) {
+        writer.Key("remaining"); writer.StartArray(); string(writer, scan.remaining); writer.EndArray();
+    } else {
+        writer.Key("words"); writer.Uint64(scan.words); writer.Key("calls"); writer.StartArray();
+        for (const auto& call : scan.calls) {
+            checkCutoff(request.cutoff);
+            writer.StartObject(); writer.Key("pc"); writer.Uint64(call.pc); writer.Key("word"); writer.Uint(call.word);
+            writer.Key("link_register"); writer.Uint(call.link); writer.Key("target"); writer.StartObject();
+            writer.Key("kind"); writer.String(call.address ? "direct" : "register");
+            if (call.address) { writer.Key("address"); writer.Uint(*call.address); }
+            else { writer.Key("register"); writer.Uint(call.source); bindingFact(writer, "value", "register-target-value-unresolved"); }
+            writer.EndObject(); bindingFact(writer, "reachability", "original-call-execution-unresolved");
+            writer.Key("alternatives"); writer.StartArray();
+            for (const auto& alternative : call.alternatives) {
+                checkCutoff(request.cutoff);
+                const auto& target = catalog.targets[alternative.target]; const auto& image = catalog.images[target.image];
+                writer.StartObject(); writer.Key("target"); string(writer, target.target); writer.Key("image_id"); string(writer, image.id);
+                writer.Key("payload_sha256"); string(writer, image.payloadHash); writer.Key("address"); writer.Uint(*call.address);
+                writer.Key("payload_offset"); writer.Uint64(alternative.offset); bindingFact(writer, "address_coverage", nullptr);
+                if (alternative.word) {
+                    writer.Key("entry_word"); writer.StartObject(); writer.Key("kind"); writer.String("four-file-bytes");
+                    writer.Key("payload_offset"); writer.Uint64(alternative.offset); writer.Key("word"); writer.Uint(*alternative.word); writer.EndObject();
+                } else bindingFact(writer, "entry_word", "destination-has-fewer-than-four-file-bytes");
+                writer.Key("reviewed_entry");
+                const common::ReviewedOriginalFunction *member = alternative.member ? &catalog.members[*alternative.member] : nullptr;
+                if (member) bindingMember(writer, *member); else writer.Null();
+                bool inScope = member && (sameMember(*member, request.scope->root)
+                    || std::any_of(request.scope->callees.begin(), request.scope->callees.end(), [&](const auto& peer) { return sameMember(*member, peer); }));
+                writer.Key("analysis_context"); writer.StartObject(); writer.Key("kind"); writer.String(inScope ? "same-image-reviewed-scope" : "not-analyzed");
+                if (inScope) { writer.Key("member"); string(writer, member->key); }
+                writer.EndObject(); bindingFact(writer, "residency", "resident-image-context-unresolved");
+                bindingFact(writer, "callee_contract", "callee-contract-not-recovered-by-static-inventory");
+                bindingFact(writer, "declaration", "callee-declaration-not-recovered-by-static-inventory"); writer.EndObject();
+            }
+            writer.EndArray(); bindingFact(writer, "active_target", "execution-target-unresolved");
+            bindingFact(writer, "scoped_observation", "validated-runtime-observation-unavailable");
+            bindingFact(writer, "universal_binding", "universal-call-binding-unresolved"); writer.EndObject();
+        }
+        writer.EndArray();
+    }
+    writer.EndObject(); writer.EndObject();
+    return std::string(buffer.GetString(), buffer.GetSize()) + "\n";
+}
+
+std::string originalBindings(const Request& request, const std::string& workspace, const std::string& payload)
+{
+    {
+        auto original = readFile((workspace + "/input/original.image").c_str(), PAYLOAD_LIMIT, request.cutoff);
+        require(original.size() == request.fileBytes && hash(original) == request.fileHash, "root original file identity differs");
+        require(payload.size() == request.payloadBytes
+            && std::equal(payload.begin(), payload.end(), original.data() + size_t(request.payloadOffset)), "root original payload bytes differ");
+    }
+    auto catalog = readBindingCatalog(request, workspace);
+    auto scan = recoverBindingAlternatives(catalog, request, workspace, payload);
+    auto bytes = serializeBindings(catalog, scan, request);
+    if (bytes.size() > BINDINGS_LIMIT) {
+        scan.refuse("binding-artifact-byte-bound");
+        bytes = serializeBindings(catalog, scan, request);
+    }
+    require(bytes.size() <= BINDINGS_LIMIT, "partial binding artifact exceeds bound");
+    checkCutoff(request.cutoff);
+    return bytes;
+}
+
 std::string status(const std::string& state, const std::string& reason, const std::string& requestBytes,
     const std::string& configBytes, const Request *request, const config::Config *config,
-    bool invoked, bool backendReturned, bool backendFailed, const Artifacts& artifacts)
+    bool invoked, bool backendReturned, bool backendFailed, const Artifacts& artifacts, bool bindingsProtocol, bool formsProtocol)
 {
     rapidjson::StringBuffer buffer;
     Writer writer(buffer);
     writer.StartObject();
-    writer.Key("schema"); writer.String("retdec118.native-status/v2");
+    writer.Key("schema"); writer.String(formsProtocol ? "retdec118.native-status/v4" : bindingsProtocol ? "retdec118.native-status/v3" : "retdec118.native-status/v2");
+    if (formsProtocol) {
+        writer.Key("source_form");
+        if (request && request->sourceForm) writer.String(common::originalSourceFormName(*request->sourceForm));
+        else writer.Null();
+    }
     writer.Key("status"); string(writer, state);
     writer.Key("reason"); string(writer, reason.substr(0, 1024));
     writer.Key("request_bytes_hex"); string(writer, hexBytes(requestBytes));
@@ -344,6 +680,12 @@ std::string status(const std::string& state, const std::string& reason, const st
     writer.Key("inferred_configuration_complete"); writer.Bool(artifacts.inferred.complete);
     writer.Key("inferred_configuration_bytes"); if (artifacts.inferred.complete) writer.Uint64(artifacts.inferred.bytes.size()); else writer.Null();
     writer.Key("inferred_configuration_sha256"); if (artifacts.inferred.complete) string(writer, hash(artifacts.inferred.bytes)); else writer.Null();
+    if (bindingsProtocol) {
+        writer.Key("bindings_attempted"); writer.Bool(artifacts.bindings.attempted);
+        writer.Key("bindings_complete"); writer.Bool(artifacts.bindings.complete);
+        writer.Key("bindings_bytes"); if (artifacts.bindings.complete) writer.Uint64(artifacts.bindings.bytes.size()); else writer.Null();
+        writer.Key("bindings_sha256"); if (artifacts.bindings.complete) string(writer, hash(artifacts.bindings.bytes)); else writer.Null();
+    }
     writer.Key("partial_retention_attempted"); writer.Bool(artifacts.partialRetention);
     writer.Key("operation"); if (request) string(writer, request->operation); else writer.Null();
     writer.Key("cutoff"); if (request) writer.Double(request->cutoff); else writer.Null();
@@ -389,7 +731,7 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *, int argc, const 
     std::string workspace, requestBytes, configBytes, reason, state = "refused";
     Request request;
     config::Config config;
-    bool requestReady = false, configReady = false, invoked = false, returned = false, failed = false;
+    bool requestReady = false, configReady = false, invoked = false, returned = false, failed = false, bindingsProtocol = false, formsProtocol = false;
     Artifacts artifacts;
     bool outputRootReady = false;
     try {
@@ -402,11 +744,16 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *, int argc, const 
         outputRootReady = true;
         requestBytes = readFile((workspace + "/input/request.json").c_str(), REQUEST_LIMIT);
         auto doc = parse(requestBytes);
+        formsProtocol = doc.IsObject() && doc.HasMember("schema") && doc["schema"].IsString()
+            && std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v4";
+        bindingsProtocol = formsProtocol || (doc.IsObject() && doc.HasMember("schema") && doc["schema"].IsString()
+            && std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v3");
         request = readRequest(doc); requestReady = true;
         configBytes = readFile((workspace + "/native/fixed-config.json").c_str(), CONFIG_LIMIT);
         auto configuration = parse(configBytes);
         require(hash(configBytes) == CONFIG_SHA, "configuration bytes differ from release");
         config = cleanConfig(configuration); configReady = true;
+        if (request.sourceForm) config.parameters.setOriginalSourceForm(*request.sourceForm);
         if (request.operation == "self-check") state = "self-check-complete";
         else {
             auto payload = readFile((workspace + "/input/image.raw").c_str(), PAYLOAD_LIMIT);
@@ -429,16 +776,30 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *, int argc, const 
             require(selected.getStart().getValue() == request.start && selected.getEnd().getValue() == request.end, "invocation range differs");
             request.invokedStart = selected.getStart().getValue();
             request.invokedEnd = selected.getEnd().getValue();
+            if (bindingsProtocol) {
+                artifacts.bindings.bytes = originalBindings(request, workspace, payload);
+                retain((workspace + "/work/bindings.json").c_str(), artifacts.bindings, BINDINGS_LIMIT);
+            }
             checkCutoff(request.cutoff);
             invoked = true;
             failed = retdec::decompile(config, &artifacts.tokens.bytes);
             returned = true;
             artifacts.inferredComputed = true;
-            artifacts.inferred.bytes = config.generateJsonString();
+            artifacts.inferred.bytes = compactInferredConfiguration(config.generateJsonString());
             retain((workspace + "/work/tokens.json").c_str(), artifacts.tokens, TOKENS_LIMIT);
             retain((workspace + "/work/inferred-config.json").c_str(), artifacts.inferred, INFERRED_LIMIT);
             require(!failed, "RetDec reported failure");
             require(!artifacts.tokens.bytes.empty(), "RetDec emitted no token document");
+            if (request.sourceForm) {
+                auto tokens = parse(artifacts.tokens.bytes);
+                fields(tokens, {"tokens", "language"});
+                require(tokens["tokens"].IsArray() && !tokens["tokens"].Empty()
+                    && text(tokens["language"]) == "C", "RetDec source-form token document incomplete");
+                require(artifacts.tokens.complete && artifacts.inferred.complete && artifacts.bindings.complete,
+                    "source-form artifact retention incomplete");
+                require(config.parameters.getOriginalSourceForm() == request.sourceForm,
+                    "source-form invocation choice changed");
+            }
             checkCutoff(request.cutoff);
             state = "generation-complete";
         }
@@ -451,7 +812,7 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *, int argc, const 
         try {
             if (!artifacts.inferredComputed) {
                 artifacts.inferredComputed = true;
-                artifacts.inferred.bytes = config.generateJsonString();
+                artifacts.inferred.bytes = compactInferredConfiguration(config.generateJsonString());
             }
         } catch (const std::exception& error) {
             reason += std::string("; partial configuration: ") + error.what();
@@ -470,7 +831,7 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *, int argc, const 
     if (!outputRootReady) return RZ_CMD_STATUS_ERROR;
     try {
         writeFile((workspace + "/work/status.json").c_str(), status(state, reason, requestBytes, configBytes,
-            requestReady ? &request : nullptr, configReady ? &config : nullptr, invoked, returned, failed, artifacts), STATUS_LIMIT);
+            requestReady ? &request : nullptr, configReady ? &config : nullptr, invoked, returned, failed, artifacts, bindingsProtocol, formsProtocol), STATUS_LIMIT);
     } catch (const std::exception&) {
         return RZ_CMD_STATUS_ERROR;
     }

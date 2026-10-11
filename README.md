@@ -6,16 +6,16 @@ the customized [retdec-psx](https://github.com/loopyd/retdec-psx) backend.
 
 ## Scope
 
-The fork develops decompilation of little-endian, 32-bit PS1 MIPS code for the
-BOF3 reverse-engineering workspace. It keeps ordinary Rizin function commands and
+The fork develops decompilation of little-endian, 32-bit PS1 MIPS code.
+It keeps ordinary Rizin function commands and
 adds `pdzar` for bounded generation from verified original bytes.
 
 The two repositories have separate roles:
 
-| Repository | Workspace path | Role |
+| Repository | Sibling directory | Role |
 | --- | --- | --- |
-| [rz-psxdec](https://github.com/loopyd/rz-psxdec) | `third_party/rz-psxdec` | Rizin plugin and console commands |
-| [retdec-psx](https://github.com/loopyd/retdec-psx) | `third_party/retdec-psx` | Customized RetDec backend linked into the plugin |
+| [rz-psxdec](https://github.com/loopyd/rz-psxdec) | `rz-psxdec` | Rizin plugin and console commands |
+| [retdec-psx](https://github.com/loopyd/retdec-psx) | `retdec-psx` | Customized RetDec backend linked into the plugin |
 
 ## Build
 
@@ -85,22 +85,10 @@ revision. The generated plugin version is
 `rz-psxdec@<plugin-40-SHA>+retdec-psx@<backend-40-SHA>`. Keep both source trees
 unchanged through the build. The Rizin ABI version remains Rizin's own version.
 
-In the BOF3 workspace, the existing lifecycle supplies the pinned sources and
-records a verified build receipt:
-
-```sh
-bin/harness setup --component rz-psxdec --force
-bin/harness doctor --component rz-psxdec
-```
-
-Setup prints the verified DSO and `native-build.json` paths under a fresh
-`build/third_party/rz-psxdec/attempt-*` directory. Its maintained guide is
-`tools/retdec-psx/README.md` in that workspace.
-
 ## Use
 
 Set `rizin_binary` to the Rizin executable from the configured installation.
-Set `dso` to the built `rz-psxdec.so`, or the verified path printed by setup.
+Set `dso` to the built `rz-psxdec.so`.
 For an extracted raw payload, set `payload` to its file and `load_address` to its
 proven runtime address:
 
@@ -134,18 +122,15 @@ generation, pass an absolute workspace to `pdzar`. That workspace must contain a
 validated `input/request.json`, `input/image.raw` and the release's fixed
 `native/fixed-config.json`.
 
-The BOF3 harness prepares those inputs and preserves the generation boundary.
-Its guides are `tools/retdec-psx/preparation.md` and
-`tools/retdec-psx/reconstruction.md`. Ordinary function commands do not establish
-original-only input provenance.
+Ordinary function commands do not establish original-only input provenance.
 
 ## Evidence limits
 
 Generated C and inferred declarations require independent review. A successful
 plugin invocation, compilation or preservation comparison does not prove original
-bytes, calling contracts, associated data or placement. Full PS1 instruction and
-GTE behavior, runtime fidelity and the 118-function reconstruction milestone remain
-unproved. Held call-contract production retains its separate admission gates.
+bytes, calling contracts, associated data or placement. Unsupported instruction,
+control or memory facts remain explicit obligations. Inferred machine values
+alone do not establish source C declarations.
 
 Keep private original images, authored evaluator references and byte-bearing
 captures local. Original-only generation withholds authored answers, names, maps
