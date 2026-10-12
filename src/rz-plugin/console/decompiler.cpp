@@ -90,7 +90,7 @@ config::Config DecompilerConsole::createConsoleConfig(const RizinDatabase& binIn
 	config.parameters.selectedRanges.insert(fnc);
 	config.parameters.setIsSelectedDecodeOnly(true);
 
-	binInfo.fetchFunctionsAndGlobals(config);
+	if (!config.parameters.getPsxMemoryContext()) binInfo.fetchFunctionsAndGlobals(config);
 
 	return config;
 }

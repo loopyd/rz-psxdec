@@ -13,6 +13,7 @@
 #include "rz-plugin/data.h"
 #include "rz-plugin/console/decompiler.h"
 #include "rz-plugin/version.h"
+#include "rz-plugin/psx_overlays.h"
 
 using namespace retdec::rzplugin;
 using namespace retdec::utils::io;
@@ -24,6 +25,7 @@ static bool rz_retdec_init(RzCore *core, void **)
 
 static bool rz_retdec_fini(RzCore *core, void *)
 {
+	clearPsxOverlayState(core);
 	return DecompilerConsole::deregisterCommands(core->rcmd);
 }
 

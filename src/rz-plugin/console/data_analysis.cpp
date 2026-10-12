@@ -32,6 +32,16 @@ static const RzCmdDescArg args_workspace[] = {
     {},
 };
 
+static const RzCmdDescArg args_mounts[] = {
+    with(RzCmdDescArg, $.name = "metadata"; $.type = RZ_CMD_ARG_TYPE_FILE;),
+    with(RzCmdDescArg, $.name = "image-id"; $.type = RZ_CMD_ARG_TYPE_STRING; $.flags = RZ_CMD_ARG_FLAG_ARRAY;),
+    {},
+};
+static const RzCmdDescArg args_dismounts[] = {
+    with(RzCmdDescArg, $.name = "image-id"; $.type = RZ_CMD_ARG_TYPE_STRING; $.flags = RZ_CMD_ARG_FLAG_ARRAY;),
+    {},
+};
+
 static const RzCmdDescArg args_range[] = {
 	with(RzCmdDescArg,
 		$.name = "start";
@@ -72,6 +82,13 @@ Console::Command DataAnalysisConsole::RecoverOriginalRange(
     recoverOriginalRange
 );
 
+Console::Command DataAnalysisConsole::ShowOverlays(
+    with(RzCmdDescHelp, $.summary = "Show the active native PSX memory context."; $.args = args_none;), showOverlays);
+Console::Command DataAnalysisConsole::MountOverlays(
+    with(RzCmdDescHelp, $.summary = "Mount original images in order from validated load metadata."; $.args = args_mounts;), mountOverlays);
+Console::Command DataAnalysisConsole::DismountOverlays(
+    with(RzCmdDescHelp, $.summary = "Dismount images and reveal earlier static mappings."; $.args = args_dismounts;), dismountOverlays);
+
 DataAnalysisConsole::DataAnalysisConsole(): Console(
 	with(RzCmdDescHelp,
 		$.summary = "Run RetDec analysis.";
@@ -80,6 +97,9 @@ DataAnalysisConsole::DataAnalysisConsole(): Console(
 	AnalyzeRange,
 	{
 		{"a", AnalyzeWholeBinary},
+		{"o", ShowOverlays},
+		{"om", MountOverlays},
+		{"ou", DismountOverlays},
 		{"r", RecoverOriginalRange}
 	})
 {
@@ -137,7 +157,7 @@ RzCmdStatus DataAnalysisConsole::analyzeRange(RzCore *core, int argc, const char
 		if (code == nullptr)
 			return RZ_CMD_STATUS_ERROR;
 
-		info.setFunctions(config);
+		if (!config.parameters.getPsxMemoryContext()) info.setFunctions(config);
 
 		return RZ_CMD_STATUS_OK;
 	} catch (const std::exception& e){
@@ -158,7 +178,7 @@ RzCmdStatus DataAnalysisConsole::analyzeWholeBinary(RzCore *core, int argc, cons
 			return RZ_CMD_STATUS_ERROR;
 
 		// r_core_annotated_code_print(code, nullptr);
-		info.setFunctions(config);
+		if (!config.parameters.getPsxMemoryContext()) info.setFunctions(config);
 
 		return RZ_CMD_STATUS_OK;
 	} catch (const std::exception& e) {

@@ -114,6 +114,9 @@ Use `pdz?` and `pdza?` to inspect its commands:
 | `pdza [start [end]]` | Analyze and import functions in a range |
 | `pdzaa` | Analyze and import all functions |
 | `pdzar /absolute/workspace` | Generate from the fixed original-only workspace request |
+| `pdzaom /absolute/metadata.json image-id...` | Mount original images in the supplied order |
+| `pdzaou image-id...` | Dismount images |
+| `pdzao` | Print the active native memory context as JSON |
 | `pdze` | Show the plugin's output-directory environment setting |
 
 `DEC_SAVE_DIR` selects the ordinary decompilation output directory. Interactive
@@ -123,6 +126,58 @@ validated `input/request.json`, `input/image.raw` and the release's fixed
 `native/fixed-config.json`.
 
 Ordinary function commands do not establish original-only input provenance.
+
+## Overlay state
+
+Mount the executable first, then the overlays needed for the selected static
+state. Each image must have original bytes and explicit load metadata:
+
+```text
+pdzaom /absolute/metadata.json executable overlay-a overlay-b
+pdzao
+pdzaou overlay-a overlay-b
+```
+
+Later mounts replace overlapping bytes. Mounting an unchanged image again keeps
+its position. Dismount it before mounting it again to change that position.
+Dismounting reveals an earlier mounted image, or leaves an unmapped gap. It models
+static image selection, not the bytes a running game leaves in RAM after unloading.
+Each command batch either succeeds in full or preserves the previous context.
+
+Metadata accepts `psx.overlay-images/v1` with an `images` array. Each image has a
+unique `image_id` and these fields:
+
+| Fields | Meaning |
+| --- | --- |
+| `target`, `file_path` | Image label and absolute original-file path |
+| `file_sha256`, `file_bytes` | Complete file identity and size |
+| `payload_offset`, `payload_sha256`, `payload_bytes` | Payload slice and its identity |
+| `load_address`, `mapping_kind` | Explicit RAM address and placement evidence kind |
+
+Digests are lowercase SHA-256 strings. Offsets, sizes and addresses are JSON
+integers. `psx-exe-header` placement must agree with the original PS-X EXE header.
+For a raw image, use `original-catalog` and supply `mapping_path` and
+`mapping_sha256` for a catalog that records the exact image, slice and load address.
+The existing `retdec118.original-image-catalog/v1` catalog is also accepted
+directly, with its sibling `images/NNN.image` files.
+
+The native loader checks file and payload hashes before mounting. Mappings must
+fit PS1's 2 MiB RAM. KUSEG, KSEG0 and KSEG1 aliases share byte ownership. A context
+supports at most 128 mounted images and 64 MiB of payloads. `pdzao` records mount
+order, placement evidence, visible intervals and a context digest. Mounted
+decompilation requires raw little-endian MIPS input. It uses the native context
+for instruction and data reads and keeps its results separate from Rizin's
+inferred functions and globals. Decompilation caches include the context digest.
+
+Original-only requests use `retdec118.native-request/v5` and declare the ordered
+`overlay_mounts` image IDs. The request binds the staged catalog hash and permitted
+Problem. An existing interactive context must match that request. Earlier request
+versions reject ambient mounts. This path requires canonical KSEG0 load and
+function addresses. Mounted direct callees can be discovered from
+original instructions within the native bounds. Their output records remain
+separate from reviewed functions and retain unresolved obligations.
+Discovery admits at most 32 callees, 256 instruction words per callee and 4096
+words in total.
 
 ## Evidence limits
 

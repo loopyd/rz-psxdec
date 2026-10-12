@@ -24,6 +24,7 @@
 
 #include "rz-plugin/console/data_analysis.h"
 #include "rz-plugin/rzretdec.h"
+#include "rz-plugin/psx_overlays.h"
 
 namespace retdec {
 namespace rzplugin {
@@ -230,16 +231,21 @@ struct Request {
     std::string fileHash, payloadHash, rangeHash, catalogHash;
     std::optional<common::OriginalCallScope> scope;
     std::optional<common::OriginalSourceForm> sourceForm;
+    std::vector<std::string> overlayMounts;
+    bool overlays = false;
 };
 
 Request readRequest(const rapidjson::Document& doc)
 {
     require(doc.IsObject() && doc.HasMember("schema"), "request schema missing");
     auto schema = text(doc["schema"]);
-    bool forms = schema == "retdec118.native-request/v4";
-    bool bindings = forms || schema == "retdec118.native-request/v3";
+    bool overlays = schema == "retdec118.native-request/v5";
+    bool forms = schema == "retdec118.native-request/v4" || (overlays && doc.HasMember("source_form"));
+    bool bindings = overlays || forms || schema == "retdec118.native-request/v3";
     bool graph = bindings || schema == "retdec118.native-request/v2";
-    if (forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form"});
+    if (overlays && forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form", "overlay_mounts"});
+    else if (overlays) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "overlay_mounts"});
+    else if (forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form"});
     else if (bindings) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256"});
     else if (graph) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees"});
     else fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image"});
@@ -248,6 +254,17 @@ Request readRequest(const rapidjson::Document& doc)
     require(digest(doc["config_sha256"]) == CONFIG_SHA, "configuration identity is not this release");
     require(doc["cutoff"].IsNumber() && !doc["cutoff"].IsBool(), "cutoff must be numeric");
     Request request;
+    request.overlays = overlays;
+    if (overlays) {
+        require(doc["overlay_mounts"].IsArray() && !doc["overlay_mounts"].Empty()
+            && doc["overlay_mounts"].Size() <= CATALOG_IMAGE_LIMIT, "overlay mount inventory rejected");
+        std::set<std::string> mounted;
+        for (const auto& id : doc["overlay_mounts"].GetArray()) {
+            auto name = text(id);
+            require(mounted.insert(name).second, "overlay mount inventory duplicates an image");
+            request.overlayMounts.push_back(std::move(name));
+        }
+    }
     if (forms) request.sourceForm = common::parseOriginalSourceForm(text(doc["source_form"]));
     if (bindings) request.catalogHash = digest(doc["image_catalog_sha256"]);
     request.operation = text(doc["operation"]);
@@ -725,7 +742,7 @@ std::string status(const std::string& state, const std::string& reason, const st
 
 }
 
-RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *, int argc, const char **argv)
+RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *core, int argc, const char **argv)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     std::string workspace, requestBytes, configBytes, reason, state = "refused";
@@ -745,10 +762,14 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *, int argc, const 
         requestBytes = readFile((workspace + "/input/request.json").c_str(), REQUEST_LIMIT);
         auto doc = parse(requestBytes);
         formsProtocol = doc.IsObject() && doc.HasMember("schema") && doc["schema"].IsString()
-            && std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v4";
+            && (std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v4"
+                || (std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v5" && doc.HasMember("source_form")));
         bindingsProtocol = formsProtocol || (doc.IsObject() && doc.HasMember("schema") && doc["schema"].IsString()
-            && std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v3");
+            && (std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v3"
+                || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v5"));
         request = readRequest(doc); requestReady = true;
+        auto ambient = psxOverlaySnapshot(core);
+        require(request.overlays || !ambient || ambient->mounts().empty(), "active overlays require an explicit v5 request");
         configBytes = readFile((workspace + "/native/fixed-config.json").c_str(), CONFIG_LIMIT);
         auto configuration = parse(configBytes);
         require(hash(configBytes) == CONFIG_SHA, "configuration bytes differ from release");
@@ -766,6 +787,25 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *, int argc, const 
                     require(hash(payload.substr(size_t(callee.start - request.load), size_t(callee.end - callee.start)))
                         == callee.rangeHash, "callee original range hash differs");
                 config.parameters.setOriginalCallScope(*request.scope);
+            }
+            if (request.overlays) {
+                checkCutoff(request.cutoff);
+                readBindingCatalog(request, workspace);
+                auto images = loader::readPsxImageMetadata(workspace + "/input/image-catalog.json");
+                std::vector<loader::PsxOverlayOperation> mounts;
+                for (const auto& id : request.overlayMounts) {
+                    auto found = std::find_if(images.begin(), images.end(), [&](const auto& image) { return image.id == id; });
+                    require(found != images.end(), "declared overlay image missing from catalog");
+                    mounts.push_back({loader::PsxOverlayOperation::Kind::Mount, id, *found});
+                }
+                loader::PsxOverlayManager manager;
+                auto context = manager.apply(mounts);
+                checkCutoff(request.cutoff);
+                if (ambient && !ambient->mounts().empty()) require(ambient->identity() == context->identity(), "active overlay context differs from request");
+                auto root = context->resolve(request.start, request.end - request.start);
+                require(root && root->image->id == request.scope->root.imageId && root->image->payloadHash == request.payloadHash
+                    && hash(reinterpret_cast<const char*>(root->bytes), root->size) == request.rangeHash, "active overlay root ownership differs");
+                config.parameters.setPsxMemoryContext(std::move(context));
             }
             config.parameters.setInputFile((workspace + "/input/image.raw").c_str());
             config.parameters.setSectionVMA(common::Address(request.load));

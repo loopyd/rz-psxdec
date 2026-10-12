@@ -19,6 +19,7 @@
 #include "rz-plugin/rzretdec.h"
 #include "rz-plugin/cgen.h"
 #include "rz-plugin/utils.h"
+#include "rz-plugin/psx_overlays.h"
 
 #include "decompiler-config.h"
 
@@ -201,6 +202,12 @@ std::string cacheName(const common::Function& fnc)
 config::Config createConfig(const RizinDatabase& binInfo, const std::string& cacheSuffix)
 {
 	auto config = loadDefaultConfig();
+	auto context = psxOverlaySnapshot(&binInfo.core());
+	if (context && !context->mounts().empty()) {
+		config.parameters.setPsxMemoryContext(context);
+		config.architecture.setIsMips(); config.architecture.setBitSize(32); config.architecture.setIsEndianLittle();
+		config.fileFormat.setIsRaw32(); config.fileType.setIsExecutable();
+	}
 
 	// Fetch binary name -> will be used for caching
 	std::string binName = binInfo.fetchFilePath();
@@ -211,6 +218,7 @@ config::Config createConfig(const RizinDatabase& binInfo, const std::string& cac
 
 	// Function is identified as : NAME@HEX_ADDR
 	auto outName = fs::path(str.str())/cacheSuffix;
+	if (config.parameters.getPsxMemoryContext()) outName /= context->identity();
 
 	auto outDir = getOutDirPath(outName);
 
@@ -235,12 +243,10 @@ std::pair<RzAnnotatedCode*, retdec::config::Config> decompile(
 		bool useCache)
 {
 	try {
+		const auto initialConfig = config;
 		if (useCache && usableCacheExists(config)) {
 			R2CGenerator outgen;
 			return {outgen.generateOutput(config.parameters.getOutputFile()), config};
-		}
-		else {
-			createConfigHashFile(config);
 		}
 
 		// Interface uses non-const config.
@@ -264,7 +270,10 @@ std::pair<RzAnnotatedCode*, retdec::config::Config> decompile(
 		Log::set(Log::Type::Error, Logger::Ptr(new Logger(std::cerr)));
 
 		R2CGenerator outgen;
-		return {outgen.generateOutput(config.parameters.getOutputFile()), config};
+		auto* code = outgen.generateOutput(config.parameters.getOutputFile());
+		if (!code) throw DecompilationError("decompilation output is incomplete");
+		createConfigHashFile(initialConfig);
+		return {code, config};
 	}
 	catch (const std::exception &err) {
 		Log::set(Log::Type::Info, Logger::Ptr(new Logger(std::cout)));
@@ -293,7 +302,7 @@ RZ_API RzAnnotatedCode* decompile(RzCore *core, ut64 addr){
 	config.parameters.selectedRanges.insert(fnc);
 	config.parameters.setIsSelectedDecodeOnly(true);
 
-	binInfo.fetchFunctionsAndGlobals(config);
+	if (!config.parameters.getPsxMemoryContext()) binInfo.fetchFunctionsAndGlobals(config);
 
 	auto [code, _] = decompile(config, true);
 	return code;

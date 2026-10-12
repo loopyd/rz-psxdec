@@ -33,6 +33,7 @@ public:
 	static Console::Command AnalyzeWholeBinary;
 
 	static Console::Command RecoverOriginalRange;
+	static Console::Command ShowOverlays, MountOverlays, DismountOverlays;
 
 	static const Console *getInstance() { return &console; }
 
@@ -45,6 +46,9 @@ private:
 
 private:
 	static RzCmdStatus recoverOriginalRange(RzCore *core, int argc, const char **argv);
+	static RzCmdStatus showOverlays(RzCore*, int, const char**);
+	static RzCmdStatus mountOverlays(RzCore*, int, const char**);
+	static RzCmdStatus dismountOverlays(RzCore*, int, const char**);
 
 private:
 	/// Singleton.
