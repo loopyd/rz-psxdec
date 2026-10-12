@@ -170,9 +170,10 @@ for instruction and data reads and keeps its results separate from Rizin's
 inferred functions and globals. Decompilation caches include the context digest.
 
 Original-only requests use `retdec118.native-request/v5` and declare the ordered
-`overlay_mounts` image IDs. The request binds the staged catalog hash and permitted
-Problem. An existing interactive context must match that request. Earlier request
-versions reject ambient mounts. This path requires canonical KSEG0 load and
+`overlay_mounts` image IDs. The request binds the staged catalog and generator input
+with `image_catalog_sha256` and `problem_sha256`. An existing interactive context
+must match that request. Earlier request versions reject ambient mounts. This path
+requires canonical KSEG0 load and
 function addresses. Mounted direct callees can be discovered from
 original instructions within the native bounds. Their output records remain
 separate from reviewed functions and retain unresolved obligations.
