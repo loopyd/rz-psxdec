@@ -791,7 +791,7 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *core, int argc, co
             if (request.overlays) {
                 checkCutoff(request.cutoff);
                 readBindingCatalog(request, workspace);
-                auto images = loader::readPsxImageMetadata(workspace + "/input/image-catalog.json");
+                auto images = loader::readPsxImageMetadata(workspace + "/input/image-catalog.json", request.catalogHash);
                 std::vector<loader::PsxOverlayOperation> mounts;
                 for (const auto& id : request.overlayMounts) {
                     auto found = std::find_if(images.begin(), images.end(), [&](const auto& image) { return image.id == id; });
