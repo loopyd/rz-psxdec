@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <fcntl.h>
 #include <map>
 #include <set>
@@ -172,6 +173,12 @@ void fields(const rapidjson::Value& value, std::initializer_list<const char *> n
     require(observed == expected, "required JSON field missing");
 }
 
+const rapidjson::Value& member(const rapidjson::Value& value, const char* name)
+{
+    require(value.IsObject() && value.HasMember(name), "required observation field missing");
+    return value[name];
+}
+
 std::string text(const rapidjson::Value& value, size_t limit = 256)
 {
     require(value.IsString() && value.GetStringLength() > 0 && value.GetStringLength() <= limit, "bounded text required");
@@ -233,17 +240,126 @@ struct Request {
     std::optional<common::OriginalSourceForm> sourceForm;
     std::vector<std::string> overlayMounts;
     bool overlays = false;
+    std::optional<common::OriginalEntryObservation> entryObservation;
 };
 
-Request readRequest(const rapidjson::Document& doc)
+common::OriginalEntryObservation readEntryObservation(const rapidjson::Value& value,
+    const std::string& workspace, double cutoff)
+{
+    fields(value, {"function", "image_id", "image_sha256", "entry_pc", "state", "files"});
+    common::OriginalEntryObservation observation;
+    observation.function = text(value["function"]); observation.imageId = text(value["image_id"]);
+    observation.imageHash = digest(value["image_sha256"]);
+    observation.pc = uint32_t(number(value["entry_pc"], UINT32_MAX));
+    fields(value["state"], {"bytes", "sha256"});
+    auto stateBytes = number(value["state"]["bytes"], 64 << 20);
+    observation.stateHash = digest(value["state"]["sha256"]);
+    const auto& captures = value["files"];
+    fields(captures, {"entry-receipt.json", "cpu-receipt.json", "registers.json", "ram.bin", "cpu.json"});
+    std::map<std::string, std::string> files, hashes;
+    for (const auto& name : {"entry-receipt.json", "cpu-receipt.json", "registers.json", "ram.bin", "cpu.json"}) {
+        const auto& record = captures[name]; fields(record, {"path", "bytes", "sha256"});
+        auto path = text(record["path"]);
+        require(path == std::string("input/entry-") + name, "entry observation path rejected");
+        auto limit = std::string(name) == "ram.bin" || std::string(name).find("receipt") != std::string::npos ? 2 << 20 : 64 << 10;
+        auto bytes = readFile((workspace + "/" + path).c_str(), limit, cutoff);
+        hashes[name] = digest(record["sha256"]);
+        require(bytes.size() == number(record["bytes"], limit) && hash(bytes) == hashes[name], "entry observation capture identity differs");
+        files.emplace(name, std::move(bytes));
+    }
+    auto entry = parse(files.at("entry-receipt.json")), cpu = parse(files.at("cpu-receipt.json"));
+    for (const auto* receipt : {&entry, &cpu}) {
+        require(receipt->IsObject() && receipt->HasMember("schema") && receipt->HasMember("status")
+            && text((*receipt)["schema"]) == "psx.runtime-session/v2" && text((*receipt)["status"]) == "passed", "entry observation receipt rejected");
+        fields(member(*receipt, "mission"), {"kind", "name", "resources"});
+        require(text((*receipt)["mission"]["kind"]) == "builtin", "entry observation mission rejected");
+        fields(member(*receipt, "completion"), {"schema", "captures"});
+        require(member(*receipt, "inputs").IsObject() && member(*receipt, "emulator").IsObject()
+            && member(*receipt, "arguments").IsObject(), "entry receipt inputs rejected");
+    }
+    require(text(entry["mission"]["name"]) == "target" && text(cpu["mission"]["name"]) == "state", "entry observation mission differs");
+    require(text(member(cpu["arguments"], "PATH")) == "registers" && text(member(cpu["arguments"], "DEPTH")) == "2", "entry CPU query differs");
+    for (auto key : {"revision", "binary_sha256", "sdl_sha256"})
+        require(text(member(entry["emulator"], key)) == text(member(cpu["emulator"], key)), "entry emulator identity differs");
+    const auto& state = member(cpu["inputs"], "file:STATE");
+    fields(state, {"path", "bytes", "sha256"});
+    require(!entry["inputs"].HasMember("executable"), "entry observation executable injection rejected");
+    for (auto key : {"bytes", "sha256"}) {
+        const auto& a = member(member(entry["inputs"], "bios"), key);
+        const auto& b = member(member(cpu["inputs"], "bios"), key);
+        require((a.IsString() && b.IsString() && text(a) == text(b))
+            || (a.IsUint64() && b.IsUint64() && a.GetUint64() == b.GetUint64()), "entry BIOS identity differs");
+    }
+    require(number(state["bytes"], 64 << 20) == stateBytes && digest(state["sha256"]) == observation.stateHash, "CPU inspected state identity differs");
+    auto captureMatches = [&](const rapidjson::Value& receipt, const char* name, size_t bytes, const std::string& sha) {
+        require(text(receipt["completion"]["schema"]) == "psx.runtime-completion/v1" && receipt["completion"]["captures"].IsArray()
+            && receipt["completion"]["captures"].Size() <= 128, "entry receipt completion rejected");
+        size_t matches = 0;
+        for (const auto& record : receipt["completion"]["captures"].GetArray()) {
+            fields(record, {"path", "bytes", "sha256"});
+            if (text(record["path"]) == name) {
+                require(number(record["bytes"], 64 << 20) == bytes && digest(record["sha256"]) == sha, "entry receipt capture differs"); ++matches;
+            }
+        }
+        require(matches == 1, "entry receipt capture missing or duplicated");
+    };
+    captureMatches(entry, "state.pbuf", stateBytes, observation.stateHash);
+    captureMatches(entry, "registers.json", files.at("registers.json").size(), hashes.at("registers.json"));
+    captureMatches(entry, "ram.bin", files.at("ram.bin").size(), hashes.at("ram.bin"));
+    captureMatches(cpu, "query.json", files.at("cpu.json").size(), hashes.at("cpu.json"));
+    auto registers = parse(files.at("registers.json")), query = parse(files.at("cpu.json"));
+    fields(registers, {"schema", "pc", "cycles", "registers"});
+    require(text(registers["schema"]) == "psx.runtime-registers/v1"
+        && number(registers["pc"], UINT32_MAX) == observation.pc
+        && registers["registers"].IsArray() && registers["registers"].Size() == 32, "entry native registers rejected");
+    fields(query, {"schema", "path", "value"});
+    require(text(query["schema"]) == "psx.runtime-query/v1" && text(query["path"]) == "registers", "entry CPU query rejected");
+    auto queryFields = [&](const rapidjson::Value& node) {
+        require(node.IsObject() && node.HasMember("fields") && node["fields"].IsArray() && node["fields"].Size() <= 32, "entry CPU fields rejected");
+        std::map<std::string, const rapidjson::Value*> values;
+        for (const auto& field : node["fields"].GetArray()) {
+            require(field.IsObject() && field.HasMember("name") && field.HasMember("present") && field.HasMember("value")
+                && field["present"].IsBool() && field["present"].GetBool(), "entry CPU field absent");
+            require(values.emplace(text(field["name"]), &field["value"]).second, "entry CPU field duplicated");
+        }
+        return values;
+    };
+    auto values = queryFields(query["value"]);
+    require(number(*values.at("pc"), UINT32_MAX) == observation.pc
+        && number(*values.at("cycle"), UINT64_MAX) == number(registers["cycles"], UINT64_MAX), "entry CPU position differs");
+    const auto& gprs = member(*values.at("gpr"), "items");
+    require(gprs.IsArray() && gprs.Size() == 34, "entry CPU GPR census differs");
+    for (unsigned reg = 0; reg < 32; ++reg)
+        require(number(gprs[reg], UINT32_MAX) == number(registers["registers"][reg], UINT32_MAX), "entry CPU registers differ");
+    for (auto name : {"next_is_delay_slot", "in_isr"})
+        require(values.at(name)->IsBool() && !values.at(name)->GetBool(), "entry CPU is not settled");
+    for (auto name : {"delay_slot_info_1", "delay_slot_info_2"}) {
+        auto pending = queryFields(*values.at(name));
+        for (auto flag : {"active", "pc_active"}) require(pending.at(flag)->IsBool() && !pending.at(flag)->GetBool(), "entry CPU has pending transfer");
+    }
+    const auto& cp0 = member(*values.at("cp0"), "items");
+    require(cp0.IsArray() && cp0.Size() == 32 && !(number(cp0[12], UINT32_MAX) & 0x10000), "entry RAM stores are cache isolated");
+    observation.sp = uint32_t(number(gprs[29], UINT32_MAX));
+    require(observation.pc % 4 == 0 && observation.sp % 4 == 0 && common::psxRamAddress(observation.sp)
+        && files.at("ram.bin").size() == 0x200000, "entry PC, SP or RAM invalid");
+    observation.ram.assign(files.at("ram.bin").begin(), files.at("ram.bin").end());
+    rapidjson::StringBuffer buffer; rapidjson::Writer<rapidjson::StringBuffer> writer(buffer); value.Accept(writer);
+    observation.identity = hash(buffer.GetString(), buffer.GetSize());
+    return observation;
+}
+
+Request readRequest(const rapidjson::Document& doc, const std::string& workspace)
 {
     require(doc.IsObject() && doc.HasMember("schema"), "request schema missing");
     auto schema = text(doc["schema"]);
-    bool overlays = schema == "retdec118.native-request/v5";
+    bool observation = schema == "retdec118.native-request/v6";
+    bool overlays = observation || schema == "retdec118.native-request/v5";
     bool forms = schema == "retdec118.native-request/v4" || (overlays && doc.HasMember("source_form"));
     bool bindings = overlays || forms || schema == "retdec118.native-request/v3";
     bool graph = bindings || schema == "retdec118.native-request/v2";
-    if (overlays && forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form", "overlay_mounts"});
+    if (observation && forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form", "overlay_mounts", "entry_observation"});
+    else if (observation) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "overlay_mounts", "entry_observation"});
+    else if (overlays && forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form", "overlay_mounts"});
     else if (overlays) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "overlay_mounts"});
     else if (forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form"});
     else if (bindings) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256"});
@@ -270,6 +386,7 @@ Request readRequest(const rapidjson::Document& doc)
     request.operation = text(doc["operation"]);
     request.cutoff = doc["cutoff"].GetDouble();
     checkCutoff(request.cutoff);
+    if (observation) request.entryObservation = readEntryObservation(doc["entry_observation"], workspace, request.cutoff);
     if (request.operation == "self-check") {
         require(!graph && doc["member"].IsNull() && doc["image"].IsNull(), "self-check cannot consume original input");
         return request;
@@ -763,11 +880,13 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *core, int argc, co
         auto doc = parse(requestBytes);
         formsProtocol = doc.IsObject() && doc.HasMember("schema") && doc["schema"].IsString()
             && (std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v4"
-                || (std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v5" && doc.HasMember("source_form")));
+                || ((std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v5"
+                    || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v6") && doc.HasMember("source_form")));
         bindingsProtocol = formsProtocol || (doc.IsObject() && doc.HasMember("schema") && doc["schema"].IsString()
             && (std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v3"
-                || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v5"));
-        request = readRequest(doc); requestReady = true;
+                || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v5"
+                || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v6"));
+        request = readRequest(doc, workspace); requestReady = true;
         auto ambient = psxOverlaySnapshot(core);
         require(request.overlays || !ambient || ambient->mounts().empty(), "active overlays require an explicit v5 request");
         configBytes = readFile((workspace + "/native/fixed-config.json").c_str(), CONFIG_LIMIT);
@@ -805,6 +924,15 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *core, int argc, co
                 auto root = context->resolve(request.start, request.end - request.start);
                 require(root && root->image->id == request.scope->root.imageId && root->image->payloadHash == request.payloadHash
                     && hash(reinterpret_cast<const char*>(root->bytes), root->size) == request.rangeHash, "active overlay root ownership differs");
+                if (request.entryObservation) {
+                    const auto& observation = *request.entryObservation;
+                    auto source = context->resolve(observation.pc, 4);
+                    require(source && source->image->id == observation.imageId && source->image->fileHash == observation.imageHash,
+                        "observed entry original image ownership differs");
+                    char address[9]; snprintf(address, sizeof(address), "%08x", observation.pc);
+                    require(observation.function == source->image->target + "@" + address, "observed entry function identity differs");
+                    config.parameters.setOriginalEntryObservation(observation);
+                }
                 config.parameters.setPsxMemoryContext(std::move(context));
             }
             config.parameters.setInputFile((workspace + "/input/image.raw").c_str());

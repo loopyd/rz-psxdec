@@ -169,7 +169,8 @@ decompilation requires raw little-endian MIPS input. It uses the native context
 for instruction and data reads and keeps its results separate from Rizin's
 inferred functions and globals. Decompilation caches include the context digest.
 
-Original-only requests use `retdec118.native-request/v5` and declare the ordered
+Original-only requests use `retdec118.native-request/v5`, or v6 when binding a
+checked runtime entry observation, and declare the ordered
 `overlay_mounts` image IDs. The request binds the staged catalog and generator input
 with `image_catalog_sha256` and `problem_sha256`. An existing interactive context
 must match that request. Earlier request versions reject ambient mounts. This path
@@ -179,6 +180,21 @@ original instructions within the native bounds. Their output records remain
 separate from reviewed functions and retain unresolved obligations.
 Discovery admits at most 32 callees, 256 instruction words per callee and 4096
 words in total.
+
+V6 adds an `entry_observation` descriptor with the function and image identity,
+entry PC, state hash and size, and capture file records. The workspace stages
+the passed native target receipt, CPU-query receipt, register capture, CPU query
+and complete RAM capture at the descriptor's `input/entry-*` paths. Native parsing
+checks their hashes, linked state identity and settled CPU state. Discovery must
+match the observed function's original instruction bytes before it can use the
+captured SP for saved-frame analysis.
+
+The resulting `scopedRestoration` metadata records saved words, store and load
+instructions, crossed calls and covered exits. Its conditions require normal
+instruction and memory completion, active original instructions, stable RAM
+mapping and cache mode, and no asynchronous or external state interference.
+These relationships retain unresolved
+universal control, effects and declaration obligations.
 
 ## Evidence limits
 
