@@ -39,8 +39,8 @@ values before extraction:
 | Capstone | `5.0-rc2` | `c47acdabb9ba4922a6d68b96eb7e14a431bfef7d7c57cea1e5881f87776228b2` |
 | YARA | `v4.2.0-rc1` | `ae1adad2ae33106f4c296cef32ddba2c93867010ef853028d30cad42548d0474` |
 
-Archive URLs and pins are in the backend's
-[cmake/deps.cmake](https://github.com/loopyd/retdec-psx/blob/master/cmake/deps.cmake).
+Archive URLs and pins are in `cmake/deps.cmake` in the
+[backend repository](https://github.com/loopyd/retdec-psx).
 Keep executable modes when extracting. YARA's build patches and writes its source
 tree, so use a disposable copy.
 
@@ -218,7 +218,7 @@ copyright 2020. Plugin source retains `LGPL-3.0-only` notices. See
 The backend derives from [Avast RetDec](https://github.com/avast/retdec), copyright
 2017 Avast Software, under the MIT license. The plugin also retains provenance
 from [retdec-r2plugin](https://github.com/avast/retdec-r2plugin), copyright 2020
-Avast Software. Backend and dependency licenses remain separate. See the
-[backend license](https://github.com/loopyd/retdec-psx/blob/master/LICENSE),
-[PeLib notice](https://github.com/loopyd/retdec-psx/blob/master/LICENSE-PELIB) and
-[third-party notices](https://github.com/loopyd/retdec-psx/blob/master/LICENSE-THIRD-PARTY).
+Avast Software. Backend and dependency licenses remain separate. The
+[backend repository](https://github.com/loopyd/retdec-psx) contains `LICENSE`,
+`LICENSE-PELIB` and `LICENSE-THIRD-PARTY` for its license, PeLib notice and
+third-party notices.
