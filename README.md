@@ -50,15 +50,16 @@ Set `rizin_prefix` to the absolute Rizin installation prefix. Set `llvm_source`,
 `libstdc++fs.a`, located with `/usr/bin/c++ -print-file-name=libstdc++fs.a`.
 If the compiler needs no separate filesystem library, omit `CMAKE_LIBRARY_PATH`.
 
-Run these commands from the parent of both clones:
+Set `build_jobs` to a positive job count within the host's available capacity.
+Run these commands from the parent of both clones, reusing the same build directory:
 
 ```sh
-build_attempt="$PWD/build/rz-psxdec"
+build_directory="$PWD/build/rz-psxdec"
 plugin_revision="$(git -C rz-psxdec rev-parse HEAD)"
 backend_revision="$(git -C retdec-psx rev-parse HEAD)"
-cmake -S rz-psxdec -B "$build_attempt/build" -G "Unix Makefiles" \
+cmake -S rz-psxdec -B "$build_directory/build" -G "Unix Makefiles" \
 	-DCMAKE_BUILD_TYPE=Release \
-	-DCMAKE_INSTALL_PREFIX="$build_attempt/prefix" \
+	-DCMAKE_INSTALL_PREFIX="$build_directory/prefix" \
 	-DCMAKE_C_COMPILER=/usr/bin/cc -DCMAKE_CXX_COMPILER=/usr/bin/c++ \
 	-DCMAKE_MAKE_PROGRAM=/usr/bin/make \
 	-DCMAKE_PREFIX_PATH="$rizin_prefix" \
@@ -71,11 +72,11 @@ cmake -S rz-psxdec -B "$build_attempt/build" -G "Unix Makefiles" \
 	-DRETDEC_PSX_REVISION="$backend_revision" \
 	-DLLVM_LOCAL_DIR="$llvm_source" -DCAPSTONE_LOCAL_DIR="$capstone_source" \
 	-DYARA_LOCAL_DIR="$yara_source"
-cmake --build "$build_attempt/build" --parallel 24 --target rz-psxdec
+cmake --build "$build_directory/build" --parallel "$build_jobs" --target rz-psxdec
 ```
 
-The DSO is `$build_attempt/build/src/rz-plugin/rz-psxdec.so`. The local install
-prefix confines RetDec's configure-time support cleanup to this build attempt.
+The DSO is `$build_directory/build/src/rz-plugin/rz-psxdec.so`. The local install
+prefix confines RetDec's configure-time support cleanup to this build directory.
 These commands do not run a top-level install or copy the DSO into an installed
 plugin directory. Keep the DSO with its build dependencies.
 
