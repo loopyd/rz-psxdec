@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
-#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -11,7 +10,6 @@
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
-#include <time.h>
 #include <tuple>
 #include <unistd.h>
 #include <vector>
@@ -80,11 +78,8 @@ std::string hash(const std::string& bytes)
     return hash(bytes.data(), bytes.size());
 }
 
-void checkCutoff(double cutoff);
-
-std::string readFile(const char *path, size_t limit, double cutoff = 0)
+std::string readFile(const char *path, size_t limit)
 {
-    if (cutoff > 0) checkCutoff(cutoff);
     Descriptor file{::open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)};
     require(file.value >= 0, "fixed input cannot be opened");
     struct stat metadata;
@@ -93,16 +88,13 @@ std::string readFile(const char *path, size_t limit, double cutoff = 0)
     std::string bytes(size_t(metadata.st_size), '\0');
     size_t position = 0;
     while (position < bytes.size()) {
-        if (cutoff > 0) checkCutoff(cutoff);
-        auto span = cutoff > 0 ? std::min<size_t>(bytes.size() - position, 64 << 10) : bytes.size() - position;
-        auto count = ::read(file.value, &bytes[position], span);
+        auto count = ::read(file.value, &bytes[position], bytes.size() - position);
         if (count < 0 && errno == EINTR) continue;
         require(count > 0, "fixed input read is incomplete");
         position += size_t(count);
     }
     char extra;
     require(::read(file.value, &extra, 1) == 0, "fixed input grew during read");
-    if (cutoff > 0) checkCutoff(cutoff);
     return bytes;
 }
 
@@ -222,16 +214,8 @@ rapidjson::Document parse(const std::string& bytes)
     return value;
 }
 
-void checkCutoff(double cutoff)
-{
-    struct timespec now;
-    require(clock_gettime(CLOCK_MONOTONIC, &now) == 0, "monotonic clock unavailable");
-    require(std::isfinite(cutoff) && cutoff > double(now.tv_sec) + double(now.tv_nsec) / 1e9, "original cutoff expired");
-}
-
 struct Request {
     std::string operation;
-    double cutoff;
     uint64_t load = 0, payloadBytes = 0, start = 0, end = 0;
     uint64_t invokedStart = 0, invokedEnd = 0;
     uint64_t fileBytes = 0, payloadOffset = 0;
@@ -244,7 +228,7 @@ struct Request {
 };
 
 common::OriginalEntryObservation readEntryObservation(const rapidjson::Value& value,
-    const std::string& workspace, double cutoff)
+    const std::string& workspace)
 {
     fields(value, {"function", "image_id", "image_sha256", "entry_pc", "state", "files"});
     common::OriginalEntryObservation observation;
@@ -262,7 +246,7 @@ common::OriginalEntryObservation readEntryObservation(const rapidjson::Value& va
         auto path = text(record["path"]);
         require(path == std::string("input/entry-") + name, "entry observation path rejected");
         auto limit = std::string(name) == "ram.bin" || std::string(name).find("receipt") != std::string::npos ? 2 << 20 : 64 << 10;
-        auto bytes = readFile((workspace + "/" + path).c_str(), limit, cutoff);
+        auto bytes = readFile((workspace + "/" + path).c_str(), limit);
         hashes[name] = digest(record["sha256"]);
         require(bytes.size() == number(record["bytes"], limit) && hash(bytes) == hashes[name], "entry observation capture identity differs");
         files.emplace(name, std::move(bytes));
@@ -357,18 +341,17 @@ Request readRequest(const rapidjson::Document& doc, const std::string& workspace
     bool forms = schema == "retdec118.native-request/v4" || (overlays && doc.HasMember("source_form"));
     bool bindings = overlays || forms || schema == "retdec118.native-request/v3";
     bool graph = bindings || schema == "retdec118.native-request/v2";
-    if (observation && forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form", "overlay_mounts", "entry_observation"});
-    else if (observation) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "overlay_mounts", "entry_observation"});
-    else if (overlays && forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form", "overlay_mounts"});
-    else if (overlays) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "overlay_mounts"});
-    else if (forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form"});
-    else if (bindings) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees", "image_catalog_sha256"});
-    else if (graph) fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image", "problem_sha256", "callees"});
-    else fields(doc, {"schema", "operation", "request_id", "config_sha256", "cutoff", "member", "image"});
+    if (observation && forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form", "overlay_mounts", "entry_observation"});
+    else if (observation) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "overlay_mounts", "entry_observation"});
+    else if (overlays && forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form", "overlay_mounts"});
+    else if (overlays) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "overlay_mounts"});
+    else if (forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form"});
+    else if (bindings) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256"});
+    else if (graph) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees"});
+    else fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image"});
     require(graph || schema == "retdec118.native-request/v1", "request schema rejected");
     digest(doc["request_id"]);
     require(digest(doc["config_sha256"]) == CONFIG_SHA, "configuration identity is not this release");
-    require(doc["cutoff"].IsNumber() && !doc["cutoff"].IsBool(), "cutoff must be numeric");
     Request request;
     request.overlays = overlays;
     if (overlays) {
@@ -384,9 +367,7 @@ Request readRequest(const rapidjson::Document& doc, const std::string& workspace
     if (forms) request.sourceForm = common::parseOriginalSourceForm(text(doc["source_form"]));
     if (bindings) request.catalogHash = digest(doc["image_catalog_sha256"]);
     request.operation = text(doc["operation"]);
-    request.cutoff = doc["cutoff"].GetDouble();
-    checkCutoff(request.cutoff);
-    if (observation) request.entryObservation = readEntryObservation(doc["entry_observation"], workspace, request.cutoff);
+    if (observation) request.entryObservation = readEntryObservation(doc["entry_observation"], workspace);
     if (request.operation == "self-check") {
         require(!graph && doc["member"].IsNull() && doc["image"].IsNull(), "self-check cannot consume original input");
         return request;
@@ -524,7 +505,7 @@ bool sameMember(const common::ReviewedOriginalFunction& a, const common::Reviewe
 
 BindingCatalog readBindingCatalog(const Request& request, const std::string& workspace)
 {
-    auto bytes = readFile((workspace + "/input/image-catalog.json").c_str(), CATALOG_LIMIT, request.cutoff);
+    auto bytes = readFile((workspace + "/input/image-catalog.json").c_str(), CATALOG_LIMIT);
     require(hash(bytes) == request.catalogHash, "original image catalog hash differs");
     auto doc = parse(bytes);
     fields(doc, {"schema", "problem_sha256", "images", "targets", "members"});
@@ -537,7 +518,6 @@ BindingCatalog readBindingCatalog(const Request& request, const std::string& wor
     std::map<std::string, size_t> images, targets, members;
     uint64_t totalBytes = 0;
     for (const auto& row : doc["images"].GetArray()) {
-        checkCutoff(request.cutoff);
         fields(row, {"image_id", "file_sha256", "file_bytes", "payload_offset", "payload_sha256", "payload_bytes", "load_address", "payload_index"});
         BindingImage image;
         image.id = text(row["image_id"]); image.fileHash = digest(row["file_sha256"]); image.payloadHash = digest(row["payload_sha256"]);
@@ -567,7 +547,6 @@ BindingCatalog readBindingCatalog(const Request& request, const std::string& wor
     }
     std::set<std::tuple<std::string, std::string, uint64_t>> starts;
     for (const auto& row : doc["members"].GetArray()) {
-        checkCutoff(request.cutoff);
         fields(row, {"key", "target", "image_id", "start", "end", "range_sha256"});
         common::ReviewedOriginalFunction member;
         member.key = text(row["key"]); member.target = text(row["target"]); member.imageId = text(row["image_id"]);
@@ -632,7 +611,6 @@ BindingScan recoverBindingAlternatives(const BindingCatalog& catalog, const Requ
 {
     BindingScan scan{(request.end - request.start) / 4, {}, {}};
     for (uint64_t pc = request.start; pc < request.end; pc += 4) {
-        if ((pc - request.start) % 512 == 0) checkCutoff(request.cutoff);
         auto word = fileWord(payload.data() + size_t(pc - request.load));
         bool direct = word >> 26 == 3;
         if (!direct && (word & 0xfc1f07ff) != 9) continue;
@@ -645,11 +623,10 @@ BindingScan recoverBindingAlternatives(const BindingCatalog& catalog, const Requ
     size_t alternativeCount = 0;
     bool rootFound = false;
     for (size_t index = 0; index < catalog.images.size(); ++index) {
-        checkCutoff(request.cutoff);
         const auto& image = catalog.images[index];
         auto digits = std::to_string(index);
         auto path = workspace + "/input/images/" + std::string(3 - digits.size(), '0') + digits + ".image";
-        auto bytes = readFile(path.c_str(), PAYLOAD_LIMIT, request.cutoff);
+        auto bytes = readFile(path.c_str(), PAYLOAD_LIMIT);
         require(bytes.size() == image.fileBytes && hash(bytes) == image.fileHash, "catalog original file identity differs");
         const char *mapped = bytes.data() + size_t(image.payloadOffset);
         require(hash(mapped, size_t(image.payloadBytes)) == image.payloadHash, "catalog payload identity differs");
@@ -662,7 +639,6 @@ BindingScan recoverBindingAlternatives(const BindingCatalog& catalog, const Requ
             rootFound = true;
         }
         for (auto memberIndex : image.members) {
-            checkCutoff(request.cutoff);
             const auto& member = catalog.members[memberIndex];
             require(hash(mapped + size_t(member.start - image.load), size_t(member.end - member.start))
                 == member.rangeHash, "catalog reviewed original range hash differs");
@@ -673,7 +649,6 @@ BindingScan recoverBindingAlternatives(const BindingCatalog& catalog, const Requ
             if (target.image != index) continue;
             bool overflow = false;
             for (auto& call : scan.calls) {
-                checkCutoff(request.cutoff);
                 if (!call.address || *call.address < image.load || *call.address - image.load >= image.payloadBytes) continue;
                 if (alternativeCount == BINDING_ALTERNATIVE_LIMIT) { overflow = true; break; }
                 auto offset = uint64_t(*call.address) - image.load;
@@ -695,7 +670,6 @@ BindingScan recoverBindingAlternatives(const BindingCatalog& catalog, const Requ
         const auto& at = catalog.targets[a.target]; const auto& bt = catalog.targets[b.target];
         return std::tie(at.target, catalog.images[at.image].id) < std::tie(bt.target, catalog.images[bt.image].id);
     });
-    checkCutoff(request.cutoff);
     return scan;
 }
 
@@ -727,7 +701,6 @@ std::string serializeBindings(const BindingCatalog& catalog, const BindingScan& 
     } else {
         writer.Key("words"); writer.Uint64(scan.words); writer.Key("calls"); writer.StartArray();
         for (const auto& call : scan.calls) {
-            checkCutoff(request.cutoff);
             writer.StartObject(); writer.Key("pc"); writer.Uint64(call.pc); writer.Key("word"); writer.Uint(call.word);
             writer.Key("link_register"); writer.Uint(call.link); writer.Key("target"); writer.StartObject();
             writer.Key("kind"); writer.String(call.address ? "direct" : "register");
@@ -736,7 +709,6 @@ std::string serializeBindings(const BindingCatalog& catalog, const BindingScan& 
             writer.EndObject(); bindingFact(writer, "reachability", "original-call-execution-unresolved");
             writer.Key("alternatives"); writer.StartArray();
             for (const auto& alternative : call.alternatives) {
-                checkCutoff(request.cutoff);
                 const auto& target = catalog.targets[alternative.target]; const auto& image = catalog.images[target.image];
                 writer.StartObject(); writer.Key("target"); string(writer, target.target); writer.Key("image_id"); string(writer, image.id);
                 writer.Key("payload_sha256"); string(writer, image.payloadHash); writer.Key("address"); writer.Uint(*call.address);
@@ -769,7 +741,7 @@ std::string serializeBindings(const BindingCatalog& catalog, const BindingScan& 
 std::string originalBindings(const Request& request, const std::string& workspace, const std::string& payload)
 {
     {
-        auto original = readFile((workspace + "/input/original.image").c_str(), PAYLOAD_LIMIT, request.cutoff);
+        auto original = readFile((workspace + "/input/original.image").c_str(), PAYLOAD_LIMIT);
         require(original.size() == request.fileBytes && hash(original) == request.fileHash, "root original file identity differs");
         require(payload.size() == request.payloadBytes
             && std::equal(payload.begin(), payload.end(), original.data() + size_t(request.payloadOffset)), "root original payload bytes differ");
@@ -782,7 +754,6 @@ std::string originalBindings(const Request& request, const std::string& workspac
         bytes = serializeBindings(catalog, scan, request);
     }
     require(bytes.size() <= BINDINGS_LIMIT, "partial binding artifact exceeds bound");
-    checkCutoff(request.cutoff);
     return bytes;
 }
 
@@ -822,7 +793,6 @@ std::string status(const std::string& state, const std::string& reason, const st
     }
     writer.Key("partial_retention_attempted"); writer.Bool(artifacts.partialRetention);
     writer.Key("operation"); if (request) string(writer, request->operation); else writer.Null();
-    writer.Key("cutoff"); if (request) writer.Double(request->cutoff); else writer.Null();
     writer.Key("requested_range");
     if (request && request->operation == "generate") range(writer, request->start, request->end); else writer.Null();
     writer.Key("invoked_range");
@@ -908,7 +878,6 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *core, int argc, co
                 config.parameters.setOriginalCallScope(*request.scope);
             }
             if (request.overlays) {
-                checkCutoff(request.cutoff);
                 readBindingCatalog(request, workspace);
                 auto images = loader::readPsxImageMetadata(workspace + "/input/image-catalog.json", request.catalogHash);
                 std::vector<loader::PsxOverlayOperation> mounts;
@@ -919,7 +888,6 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *core, int argc, co
                 }
                 loader::PsxOverlayManager manager;
                 auto context = manager.apply(mounts);
-                checkCutoff(request.cutoff);
                 if (ambient && !ambient->mounts().empty()) require(ambient->identity() == context->identity(), "active overlay context differs from request");
                 auto root = context->resolve(request.start, request.end - request.start);
                 require(root && root->image->id == request.scope->root.imageId && root->image->payloadHash == request.payloadHash
@@ -948,7 +916,6 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *core, int argc, co
                 artifacts.bindings.bytes = originalBindings(request, workspace, payload);
                 retain((workspace + "/work/bindings.json").c_str(), artifacts.bindings, BINDINGS_LIMIT);
             }
-            checkCutoff(request.cutoff);
             invoked = true;
             failed = retdec::decompile(config, &artifacts.tokens.bytes);
             returned = true;
@@ -968,7 +935,6 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *core, int argc, co
                 require(config.parameters.getOriginalSourceForm() == request.sourceForm,
                     "source-form invocation choice changed");
             }
-            checkCutoff(request.cutoff);
             state = "generation-complete";
         }
     } catch (const std::exception& error) {
