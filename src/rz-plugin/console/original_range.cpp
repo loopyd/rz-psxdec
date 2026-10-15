@@ -16,6 +16,7 @@
 
 #include <openssl/sha.h>
 #include <rapidjson/document.h>
+#include <rapidjson/error/en.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 #include <retdec/config/config.h>
@@ -100,7 +101,10 @@ std::string readFile(const char *path, size_t limit)
 
 void writeFile(const char *path, const std::string& bytes, size_t limit)
 {
-    require(bytes.size() <= limit, "native artifact exceeds bound");
+    if (bytes.size() > limit) {
+        throw std::runtime_error("native artifact exceeds bound: bytes="
+            + std::to_string(bytes.size()) + " limit=" + std::to_string(limit));
+    }
     Descriptor file{::open(path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0666)};
     require(file.value >= 0, "native artifact is not fresh");
     size_t position = 0;
@@ -473,17 +477,17 @@ using Writer = rapidjson::Writer<rapidjson::StringBuffer>;
 
 std::string compactInferredConfiguration(const std::string& generated)
 {
-    try {
-        rapidjson::Document document;
-        document.Parse<rapidjson::kParseFullPrecisionFlag | rapidjson::kParseIterativeFlag>(generated.data(), generated.size());
-        if (document.HasParseError()) return generated;
-        rapidjson::StringBuffer buffer;
-        Writer writer(buffer);
-        if (!document.Accept(writer) || !writer.IsComplete()) return generated;
-        return std::string(buffer.GetString(), buffer.GetSize());
-    } catch (const std::exception&) {
-        return generated;
+    rapidjson::Document document;
+    document.Parse<rapidjson::kParseFullPrecisionFlag | rapidjson::kParseIterativeFlag>(generated.data(), generated.size());
+    if (document.HasParseError()) {
+        throw std::runtime_error("inferred configuration JSON parse failed at byte "
+            + std::to_string(document.GetErrorOffset()) + ": "
+            + rapidjson::GetParseError_En(document.GetParseError()));
     }
+    rapidjson::StringBuffer buffer;
+    Writer writer(buffer);
+    require(document.Accept(writer) && writer.IsComplete(), "inferred configuration JSON compaction failed");
+    return std::string(buffer.GetString(), buffer.GetSize());
 }
 
 void string(Writer& writer, const std::string& value)
