@@ -186,9 +186,15 @@ V6 adds an `entry_observation` descriptor with the function and image identity,
 entry PC, state hash and size, and capture file records. The workspace stages
 the passed native target receipt, CPU-query receipt, register capture, CPU query
 and complete RAM capture at the descriptor's `input/entry-*` paths. Native parsing
-checks their hashes, linked state identity and settled CPU state. Discovery must
+checks their hashes, linked state identity and pending CPU transfers. Discovery must
 match the observed function's original instruction bytes before it can use the
 captured SP for saved-frame analysis.
+
+`entryContext` retains the captured ISR marker and CP0 Status, Cause and EPC.
+A masked kernel entry inside an ISR can be analyzed when it has no pending
+transfer and cache isolation is off. Its CPU-context preservation remains an
+explicit unresolved obligation, so this admission cannot establish a return,
+declaration or saved-frame contract. Other ISR entry modes are refused.
 
 The resulting `scopedRestoration` metadata records saved words, store and load
 instructions, crossed calls and covered exits. Its conditions require normal

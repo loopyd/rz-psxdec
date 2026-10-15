@@ -315,14 +315,20 @@ common::OriginalEntryObservation readEntryObservation(const rapidjson::Value& va
     require(gprs.IsArray() && gprs.Size() == 34, "entry CPU GPR census differs");
     for (unsigned reg = 0; reg < 32; ++reg)
         require(number(gprs[reg], UINT32_MAX) == number(registers["registers"][reg], UINT32_MAX), "entry CPU registers differ");
-    for (auto name : {"next_is_delay_slot", "in_isr"})
-        require(values.at(name)->IsBool() && !values.at(name)->GetBool(), "entry CPU is not settled");
+    require(values.at("next_is_delay_slot")->IsBool() && !values.at("next_is_delay_slot")->GetBool(), "entry CPU is not settled");
+    require(values.at("in_isr")->IsBool(), "entry CPU ISR marker rejected");
+    observation.cpu.inIsr = values.at("in_isr")->GetBool();
     for (auto name : {"delay_slot_info_1", "delay_slot_info_2"}) {
         auto pending = queryFields(*values.at(name));
         for (auto flag : {"active", "pc_active"}) require(pending.at(flag)->IsBool() && !pending.at(flag)->GetBool(), "entry CPU has pending transfer");
     }
     const auto& cp0 = member(*values.at("cp0"), "items");
-    require(cp0.IsArray() && cp0.Size() == 32 && !(number(cp0[12], UINT32_MAX) & 0x10000), "entry RAM stores are cache isolated");
+    require(cp0.IsArray() && cp0.Size() == 32, "entry CPU CP0 census differs");
+    observation.cpu.status = uint32_t(number(cp0[12], UINT32_MAX));
+    observation.cpu.cause = uint32_t(number(cp0[13], UINT32_MAX));
+    observation.cpu.epc = uint32_t(number(cp0[14], UINT32_MAX));
+    require(!(observation.cpu.status & 0x10000), "entry RAM stores are cache isolated");
+    require(!observation.cpu.inIsr || !(observation.cpu.status & 3), "entry ISR requires masked kernel context");
     observation.sp = uint32_t(number(gprs[29], UINT32_MAX));
     require(observation.pc % 4 == 0 && observation.sp % 4 == 0 && common::psxRamAddress(observation.sp)
         && files.at("ram.bin").size() == 0x200000, "entry PC, SP or RAM invalid");
