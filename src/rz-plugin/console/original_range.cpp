@@ -318,8 +318,10 @@ common::OriginalEntryObservation readEntryObservation(const rapidjson::Value& va
         && number(*values.at("cycle"), UINT64_MAX) == number(registers["cycles"], UINT64_MAX), "entry CPU position differs");
     const auto& gprs = member(*values.at("gpr"), "items");
     require(gprs.IsArray() && gprs.Size() == 34, "entry CPU GPR census differs");
-    for (unsigned reg = 0; reg < 32; ++reg)
+    for (unsigned reg = 0; reg < 32; ++reg) {
         require(number(gprs[reg], UINT32_MAX) == number(registers["registers"][reg], UINT32_MAX), "entry CPU registers differ");
+        observation.registers[reg] = uint32_t(number(gprs[reg], UINT32_MAX));
+    }
     require(values.at("next_is_delay_slot")->IsBool() && !values.at("next_is_delay_slot")->GetBool(), "entry CPU is not settled");
     require(values.at("in_isr")->IsBool(), "entry CPU ISR marker rejected");
     observation.cpu.inIsr = values.at("in_isr")->GetBool();
@@ -334,8 +336,7 @@ common::OriginalEntryObservation readEntryObservation(const rapidjson::Value& va
     observation.cpu.epc = uint32_t(number(cp0[14], UINT32_MAX));
     require(!(observation.cpu.status & 0x10000), "entry RAM stores are cache isolated");
     require(!observation.cpu.inIsr || !(observation.cpu.status & 3), "entry ISR requires masked kernel context");
-    observation.sp = uint32_t(number(gprs[29], UINT32_MAX));
-    require(observation.pc % 4 == 0 && observation.sp % 4 == 0 && common::psxRamAddress(observation.sp)
+    require(observation.pc % 4 == 0 && observation.registers[29] % 4 == 0 && common::psxRamAddress(observation.registers[29])
         && files.at("ram.bin").size() == 0x200000, "entry PC, SP or RAM invalid");
     observation.ram.assign(files.at("ram.bin").begin(), files.at("ram.bin").end());
     rapidjson::StringBuffer buffer; rapidjson::Writer<rapidjson::StringBuffer> writer(buffer); value.Accept(writer);
