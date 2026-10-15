@@ -225,6 +225,7 @@ struct Request {
     std::vector<std::string> overlayMounts;
     bool overlays = false;
     std::optional<common::OriginalEntryObservation> entryObservation;
+    std::optional<common::PsxOriginalImage> copiedOriginal;
 };
 
 common::OriginalEntryObservation readEntryObservation(const rapidjson::Value& value,
@@ -342,12 +343,14 @@ Request readRequest(const rapidjson::Document& doc, const std::string& workspace
 {
     require(doc.IsObject() && doc.HasMember("schema"), "request schema missing");
     auto schema = text(doc["schema"]);
+    bool copied = schema == "retdec118.native-request/v7";
     bool observation = schema == "retdec118.native-request/v6";
-    bool overlays = observation || schema == "retdec118.native-request/v5";
-    bool forms = schema == "retdec118.native-request/v4" || (overlays && doc.HasMember("source_form"));
+    bool overlays = copied || observation || schema == "retdec118.native-request/v5";
+    bool forms = schema == "retdec118.native-request/v4" || (!copied && overlays && doc.HasMember("source_form"));
     bool bindings = overlays || forms || schema == "retdec118.native-request/v3";
     bool graph = bindings || schema == "retdec118.native-request/v2";
-    if (observation && forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form", "overlay_mounts", "entry_observation"});
+    if (copied) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "overlay_mounts", "copied_original"});
+    else if (observation && forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form", "overlay_mounts", "entry_observation"});
     else if (observation) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "overlay_mounts", "entry_observation"});
     else if (overlays && forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form", "overlay_mounts"});
     else if (overlays) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "overlay_mounts"});
@@ -360,9 +363,16 @@ Request readRequest(const rapidjson::Document& doc, const std::string& workspace
     require(digest(doc["config_sha256"]) == CONFIG_SHA, "configuration identity is not this release");
     Request request;
     request.overlays = overlays;
+    if (copied) {
+        auto path = workspace + "/input/copy-descriptor.json";
+        auto bytes = readFile(path.c_str(), REQUEST_LIMIT);
+        auto descriptor = parse(bytes);
+        require(doc["copied_original"] == descriptor, "copied descriptor differs from request");
+        request.copiedOriginal = loader::readPsxCopiedOriginal(path, hash(bytes));
+    }
     if (overlays) {
         require(doc["overlay_mounts"].IsArray() && !doc["overlay_mounts"].Empty()
-            && doc["overlay_mounts"].Size() <= CATALOG_IMAGE_LIMIT, "overlay mount inventory rejected");
+            && doc["overlay_mounts"].Size() <= CATALOG_IMAGE_LIMIT - (copied ? 1 : 0), "overlay mount inventory rejected");
         std::set<std::string> mounted;
         for (const auto& id : doc["overlay_mounts"].GetArray()) {
             auto name = text(id);
@@ -861,7 +871,8 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *core, int argc, co
         bindingsProtocol = formsProtocol || (doc.IsObject() && doc.HasMember("schema") && doc["schema"].IsString()
             && (std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v3"
                 || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v5"
-                || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v6"));
+                || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v6"
+                || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v7"));
         request = readRequest(doc, workspace); requestReady = true;
         auto ambient = psxOverlaySnapshot(core);
         require(request.overlays || !ambient || ambient->mounts().empty(), "active overlays require an explicit v5 request");
@@ -891,6 +902,22 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *core, int argc, co
                     auto found = std::find_if(images.begin(), images.end(), [&](const auto& image) { return image.id == id; });
                     require(found != images.end(), "declared overlay image missing from catalog");
                     mounts.push_back({loader::PsxOverlayOperation::Kind::Mount, id, *found});
+                }
+                if (request.copiedOriginal) {
+                    const auto& image = *request.copiedOriginal;
+                    require(std::find(request.overlayMounts.begin(), request.overlayMounts.end(), image.id)
+                        == request.overlayMounts.end(), "copied image must follow catalog mounts");
+                    auto overlaps = [&](uint64_t address, uint64_t bytes) {
+                        auto start = common::psxRamAddress(address);
+                        return start && image.loadAddress < *start + bytes && *start < image.loadAddress + image.payloadBytes;
+                    };
+                    for (const auto& mount : mounts)
+                        require(!overlaps(mount.image->loadAddress, mount.image->payloadBytes),
+                            "copied window overlaps catalog mount");
+                    require(!overlaps(request.start, request.end - request.start), "copied window overlaps selected root");
+                    if (request.scope) for (const auto& callee : request.scope->callees)
+                        require(!overlaps(callee.start, callee.end - callee.start), "copied window overlaps reviewed callee");
+                    mounts.push_back({loader::PsxOverlayOperation::Kind::Mount, image.id, image});
                 }
                 loader::PsxOverlayManager manager;
                 auto context = manager.apply(mounts);
