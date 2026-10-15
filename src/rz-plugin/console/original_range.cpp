@@ -101,7 +101,7 @@ std::string readFile(const char *path, size_t limit)
 void writeFile(const char *path, const std::string& bytes, size_t limit)
 {
     require(bytes.size() <= limit, "native artifact exceeds bound");
-    Descriptor file{::open(path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600)};
+    Descriptor file{::open(path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0666)};
     require(file.value >= 0, "native artifact is not fresh");
     size_t position = 0;
     while (position < bytes.size()) {
