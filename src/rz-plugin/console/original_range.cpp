@@ -475,6 +475,86 @@ config::Config cleanConfig(const rapidjson::Document& doc)
 
 using Writer = rapidjson::Writer<rapidjson::StringBuffer>;
 
+void uniqueConfigurationMembers(const rapidjson::Value& object)
+{
+    require(object.IsObject(), "inferred configuration object required");
+    std::set<std::string> names;
+    for (auto member = object.MemberBegin(); member != object.MemberEnd(); ++member)
+        require(names.emplace(member->name.GetString(), member->name.GetStringLength()).second,
+            "inferred configuration duplicate JSON member");
+}
+
+std::string transferSignature(const rapidjson::Value& rows)
+{
+    rapidjson::StringBuffer buffer;
+    Writer writer(buffer);
+    require(rows.Accept(writer) && writer.IsComplete(), "inferred transfer signature serialization failed");
+    return std::string(buffer.GetString(), buffer.GetSize());
+}
+
+void normalizeCallTransfers(rapidjson::Document& document)
+{
+    if (!document.IsObject() || !document.HasMember("functions")) return;
+    uniqueConfigurationMembers(document);
+    auto& functions = document["functions"];
+    require(functions.IsArray(), "inferred configuration functions array required");
+    struct SummaryTransfers {
+        const rapidjson::Value* rows;
+        std::string signature;
+    };
+    std::map<std::string, SummaryTransfers> summaries;
+    for (const auto& function : functions.GetArray()) {
+        uniqueConfigurationMembers(function);
+        auto summary = function.FindMember("originalCallSummary");
+        if (summary == function.MemberEnd()) continue;
+        uniqueConfigurationMembers(summary->value);
+        auto key = summary->value.FindMember("function");
+        auto rows = summary->value.FindMember("transfers");
+        require(key != summary->value.MemberEnd() && key->value.IsString()
+            && rows != summary->value.MemberEnd() && rows->value.IsArray(),
+            "inferred summary transfer identity or array invalid");
+        require(summaries.emplace(std::string(key->value.GetString(), key->value.GetStringLength()),
+            SummaryTransfers{&rows->value, transferSignature(rows->value)}).second,
+            "inferred summary transfer identity duplicated");
+    }
+    auto& allocator = document.GetAllocator();
+    for (auto& function : functions.GetArray()) {
+        auto disposition = function.FindMember("returnDisposition");
+        if (disposition == function.MemberEnd()) continue;
+        uniqueConfigurationMembers(disposition->value);
+        auto evidence = disposition->value.FindMember("evidence");
+        require(evidence != disposition->value.MemberEnd() && evidence->value.IsObject(),
+            "inferred return evidence object required");
+        uniqueConfigurationMembers(evidence->value);
+        auto calls = evidence->value.FindMember("calls");
+        require(calls != evidence->value.MemberEnd() && calls->value.IsArray(),
+            "inferred return calls array required");
+        for (auto& call : calls->value.GetArray()) {
+            uniqueConfigurationMembers(call);
+            auto contract = call.FindMember("contract");
+            if (contract == call.MemberEnd()) continue;
+            auto& value = contract->value;
+            uniqueConfigurationMembers(value);
+            auto callee = value.FindMember("callee");
+            auto actual = value.FindMember("registerTransfers");
+            require(callee != value.MemberEnd() && callee->value.IsString()
+                && actual != value.MemberEnd() && actual->value.IsArray()
+                && !value.HasMember("registerTransferSource"),
+                "inferred call transfer identity or array invalid");
+            auto found = summaries.find(std::string(callee->value.GetString(), callee->value.GetStringLength()));
+            bool same = !actual->value.Empty() && found != summaries.end()
+                && actual->value.Size() == found->second.rows->Size()
+                && transferSignature(actual->value) == found->second.signature;
+            rapidjson::Value source(rapidjson::kObjectType);
+            source.AddMember("encoding", rapidjson::Value("callee-or-inline/v1", allocator), allocator);
+            source.AddMember("kind", rapidjson::Value(same ? "callee-summary" : "inline", allocator), allocator);
+            if (!same) source.AddMember("rows", actual->value.Move(), allocator);
+            value.EraseMember(actual);
+            value.AddMember("registerTransferSource", source, allocator);
+        }
+    }
+}
+
 std::string compactInferredConfiguration(const std::string& generated)
 {
     rapidjson::Document document;
@@ -484,6 +564,7 @@ std::string compactInferredConfiguration(const std::string& generated)
             + std::to_string(document.GetErrorOffset()) + ": "
             + rapidjson::GetParseError_En(document.GetParseError()));
     }
+    normalizeCallTransfers(document);
     rapidjson::StringBuffer buffer;
     Writer writer(buffer);
     require(document.Accept(writer) && writer.IsComplete(), "inferred configuration JSON compaction failed");
