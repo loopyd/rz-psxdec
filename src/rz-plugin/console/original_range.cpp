@@ -197,6 +197,21 @@ uint64_t number(const rapidjson::Value& value, uint64_t maximum)
     return value.GetUint64();
 }
 
+// Every recorded cycle is carried as canonical decimal text, so a textual match
+// between two cycles is the numeric match and no wider integer is involved.
+uint64_t cycleValue(const rapidjson::Value& value)
+{
+    auto digits = text(value, 20);
+    require(digits.size() == 1 || digits.front() != '0', "pointer load cycle rejected");
+    uint64_t result = 0;
+    for (char digit : digits) {
+        require(digit >= '0' && digit <= '9' && result <= (UINT64_MAX - uint64_t(digit - '0')) / 10,
+            "pointer load cycle rejected");
+        result = result * 10 + uint64_t(digit - '0');
+    }
+    return result;
+}
+
 rapidjson::Document parse(const std::string& bytes)
 {
     unsigned depth = 0;
@@ -229,6 +244,7 @@ struct Request {
     std::vector<std::string> overlayMounts;
     bool overlays = false;
     std::optional<common::OriginalEntryObservation> entryObservation;
+    std::optional<common::OriginalPointerLoadCapture> pointerLoad;
     std::optional<common::PsxOriginalImage> copiedOriginal;
 };
 
@@ -316,6 +332,7 @@ common::OriginalEntryObservation readEntryObservation(const rapidjson::Value& va
     auto values = queryFields(query["value"]);
     require(number(*values.at("pc"), UINT32_MAX) == observation.pc
         && number(*values.at("cycle"), UINT64_MAX) == number(registers["cycles"], UINT64_MAX), "entry CPU position differs");
+    observation.cycle = number(*values.at("cycle"), UINT64_MAX);
     const auto& gprs = member(*values.at("gpr"), "items");
     require(gprs.IsArray() && gprs.Size() == 34, "entry CPU GPR census differs");
     for (unsigned reg = 0; reg < 32; ++reg) {
@@ -344,17 +361,297 @@ common::OriginalEntryObservation readEntryObservation(const rapidjson::Value& va
     return observation;
 }
 
+common::OriginalPointerLoadCapture readPointerLoad(const rapidjson::Value& value,
+    const std::string& workspace)
+{
+    fields(value, {"kind", "function", "image_id", "image_sha256", "entry_pc", "stop_pc",
+        "state", "interval", "begin_cycle", "end_cycle", "occurrences", "files"});
+    require(text(value["kind"]) == "psx-observed-pointer-load-capture/v1", "pointer load capture kind rejected");
+    common::OriginalPointerLoadCapture capture;
+    capture.function = text(value["function"]); capture.imageId = text(value["image_id"]);
+    capture.imageHash = digest(value["image_sha256"]);
+    capture.entryPc = uint32_t(number(value["entry_pc"], UINT32_MAX));
+    capture.stopPc = uint32_t(number(value["stop_pc"], UINT32_MAX));
+    fields(value["state"], {"bytes", "sha256"});
+    auto stateBytes = number(value["state"]["bytes"], 64 << 20);
+    capture.stateHash = digest(value["state"]["sha256"]);
+    fields(value["interval"], {"mapping_start", "bytes"});
+    capture.intervalStart = uint32_t(number(value["interval"]["mapping_start"], 0x1ffffc));
+    capture.intervalBytes = uint32_t(number(value["interval"]["bytes"], 0x200000));
+    require(capture.entryPc % 4 == 0 && capture.stopPc % 4 == 0
+        && common::psxRamAddress(capture.entryPc) && common::psxRamAddress(capture.stopPc)
+        && capture.intervalStart % 4 == 0 && capture.intervalBytes % 4 == 0
+        && capture.intervalBytes >= 4 && capture.intervalStart + capture.intervalBytes <= 0x200000
+        && *common::psxRamAddress(capture.entryPc) == (uint64_t(0x80000000) | capture.intervalStart),
+        "pointer load capture address or interval rejected");
+    auto cycle = [&](const char* name) {
+        cycleValue(value[name]);
+        return text(value[name], 20);
+    };
+    capture.beginCycle = cycle("begin_cycle"); capture.endCycle = cycle("end_cycle");
+    require(capture.beginCycle.size() < capture.endCycle.size()
+        || (capture.beginCycle.size() == capture.endCycle.size() && capture.beginCycle < capture.endCycle),
+        "pointer load cycle order rejected");
+    const auto& rows = value["occurrences"];
+    require(rows.IsArray() && rows.Size() >= 1 && rows.Size() <= 65536, "pointer load occurrence inventory rejected");
+    for (const auto& row : rows.GetArray()) {
+        fields(row, {"sequence", "pc", "word", "branch_delay_slot"});
+        common::OriginalPointerLoadCapture::Occurrence occurrence;
+        occurrence.sequence = number(row["sequence"], 65536);
+        occurrence.pc = number(row["pc"], UINT32_MAX);
+        occurrence.word = uint32_t(number(row["word"], UINT32_MAX));
+        require(row["branch_delay_slot"].IsBool(), "pointer load delay marker rejected");
+        occurrence.branchDelaySlot = row["branch_delay_slot"].GetBool();
+        auto physical = occurrence.pc & 0x1fffffff;
+        require(occurrence.sequence > (capture.occurrences.empty() ? 0 : capture.occurrences.back().sequence)
+            && occurrence.pc % 4 == 0 && common::psxRamAddress(occurrence.pc)
+            && physical >= capture.intervalStart
+            && physical + 4 <= uint64_t(capture.intervalStart) + capture.intervalBytes,
+            "pointer load occurrence rejected");
+        capture.occurrences.push_back(occurrence);
+    }
+    require(capture.occurrences.front().pc == capture.entryPc, "pointer load slice does not start at its entry");
+    const auto& files = value["files"];
+    fields(files, {"receipt.json", "history.json", "events.json", "events.ndjson", "payload.bin"});
+    std::map<std::string, size_t> limits{{"receipt.json", 2 << 20}, {"history.json", 64 << 10},
+        {"events.json", 1 << 20}, {"events.ndjson", 64 << 20}, {"payload.bin", 8 << 20}};
+    std::map<std::string, std::string> content;
+    for (const auto& item : limits) {
+        const auto& record = files[item.first.c_str()];
+        fields(record, {"path", "bytes", "sha256"});
+        require(text(record["path"]) == "input/pointer-" + item.first, "pointer load capture path rejected");
+        auto bytes = readFile((workspace + "/input/pointer-" + item.first).c_str(), item.second);
+        require(bytes.size() == number(record["bytes"], item.second)
+            && hash(bytes) == digest(record["sha256"]), "pointer load capture identity differs");
+        content.emplace(item.first, std::move(bytes));
+    }
+    auto receipt = parse(content.at("receipt.json"));
+    auto history = parse(content.at("history.json"));
+    auto metadata = parse(content.at("events.json"));
+    const auto& process = member(receipt, "process");
+    require(text(receipt["schema"]) == "psx.runtime-session/v2" && text(receipt["status"]) == "passed"
+        && process.IsObject() && process.HasMember("failure") && process["failure"].IsNull()
+        && number(process["exit_code"], 255) == 0,
+        "pointer load needs a successful original-only history execution");
+    fields(member(receipt, "mission"), {"kind", "name", "resources"});
+    require(text(receipt["mission"]["kind"]) == "builtin" && text(receipt["mission"]["name"]) == "history",
+        "pointer load history mission rejected");
+    const auto& inputs = member(receipt, "inputs");
+    require(inputs.IsObject() && inputs.HasMember("bios") && inputs.HasMember("disc:cue")
+        && inputs.HasMember("file:STATE") && inputs.HasMember("origin")
+        && !inputs.HasMember("executable") && !inputs.HasMember("script"), "pointer load execution inputs rejected");
+    for (auto it = inputs.MemberBegin(); it != inputs.MemberEnd(); ++it) {
+        std::string name(it->name.GetString(), it->name.GetStringLength());
+        require(name == "bios" || name == "file:STATE" || name == "origin" || name.compare(0, 5, "disc:") == 0,
+            "pointer load execution contains injected or restored inputs");
+    }
+    const auto& state = inputs["file:STATE"]; fields(state, {"path", "bytes", "sha256"});
+    require(number(state["bytes"], 64 << 20) == stateBytes && digest(state["sha256"]) == capture.stateHash,
+        "pointer load executed state differs from the captured boundary");
+    const auto& continuation = member(receipt, "origin");
+    fields(continuation, {"schema", "state_sha256", "captures", "verified", "limitations"});
+    require(text(continuation["schema"]) == "psx.runtime-origin/v1"
+        && digest(continuation["state_sha256"]) == capture.stateHash
+        && continuation["captures"].IsArray() && continuation["captures"].Size() == 1
+        && text(continuation["captures"][0]) == "state.pbuf", "pointer load origin continuation differs");
+    const auto& assets = member(receipt, "assets");
+    require(assets.IsObject() && assets.MemberCount() == 1 && assets.HasMember("file:STATE"),
+        "pointer load history must restore only the captured state");
+    fields(member(receipt, "completion"), {"schema", "captures"});
+    require(text(receipt["completion"]["schema"]) == "psx.runtime-completion/v1"
+        && receipt["completion"]["captures"].IsArray()
+        && receipt["completion"]["captures"].Size() <= 128, "pointer load capture completion rejected");
+    for (const auto& name : {"history.json", "events.json", "events.ndjson", "payload.bin"}) {
+        const auto& record = files[name];
+        size_t matches = 0;
+        for (const auto& captured : receipt["completion"]["captures"].GetArray()) {
+            fields(captured, {"path", "bytes", "sha256"});
+            if (text(captured["path"]) == name) {
+                require(number(captured["bytes"], 64 << 20) == number(record["bytes"], 64 << 20)
+                    && digest(captured["sha256"]) == digest(record["sha256"]),
+                    "pointer load capture is not receipt-bound");
+                ++matches;
+            }
+        }
+        require(matches == 1, "pointer load capture is missing from its receipt");
+    }
+    require(text(history["schema"]) == "psx.runtime-history/v2" && history["success"].IsBool()
+        && history["success"].GetBool() && history["started"].IsBool() && history["started"].GetBool()
+        && history["native_complete"].IsBool() && history["native_complete"].GetBool()
+        && text(history["profile"]) == "ram-interval-v1" && text(history["reason"]) == "stop reached"
+        && number(history["ram_start"], 0x1ffffc) == capture.intervalStart
+        && number(history["ram_length"], 0x200000) == capture.intervalBytes
+        && number(history["stop"], UINT32_MAX) == capture.stopPc
+        && number(history["frames"], number(history["frame_limit"], 36000)) <= number(history["frame_limit"], 36000),
+        "pointer load history did not reach its stop within guest bounds");
+    require(text(metadata["schema"]) == "psx.native-history/v2" && metadata["complete"].IsBool()
+        && metadata["complete"].GetBool() && number(metadata["failure_bits"], UINT64_MAX) == 0
+        && metadata["failures"].IsArray() && metadata["failures"].Empty()
+        && number(metadata["dropped_attempts"], UINT64_MAX) == 0
+        && text(metadata["begin_cycle"], 20) == capture.beginCycle
+        && text(metadata["end_cycle"], 20) == capture.endCycle
+        && metadata["build_identity"] == history["build_identity"]
+        && text(metadata["build_identity"]["binary_sha256"]) == text(receipt["emulator"]["binary_sha256"])
+        && number(metadata["payload_bytes"], 8 << 20) == content.at("payload.bin").size()
+        && text(metadata["events_file"]) == "events.ndjson"
+        && text(metadata["payload_file"]) == "payload.bin",
+        "pointer load recorder identity differs");
+    // The recorded dispatch slice, the committed writes and the endpoint image are
+    // reconstructed from the authenticated event stream. The request's occurrence rows
+    // stay claims: each one is compared with this reconstruction, never trusted.
+    const auto& payload = content.at("payload.bin");
+    require(payload.size() >= capture.intervalBytes, "pointer load payload extent differs");
+    std::string image(payload.data(), capture.intervalBytes);
+    auto wordAt = [&](size_t offset) {
+        uint32_t word = 0;
+        for (unsigned byte = 0; byte < 4; ++byte)
+            word |= uint32_t(static_cast<unsigned char>(image[offset + byte])) << (8 * byte);
+        return word;
+    };
+    const auto& stream = content.at("events.ndjson");
+    std::vector<std::string> lines;
+    for (size_t start = 0; start < stream.size();) {
+        auto end = stream.find('\n', start);
+        if (end == std::string::npos) end = stream.size();
+        lines.emplace_back(stream, start, end - start);
+        start = end + 1;
+    }
+    require(lines.size() >= 2 && lines.size() <= 65536, "pointer load event inventory rejected");
+    std::vector<common::OriginalPointerLoadCapture::Occurrence> recorded;
+    struct CommittedWrite { uint32_t physical = 0, bytes = 0; };
+    std::vector<CommittedWrite> writes;
+    std::map<std::string, uint64_t> kinds;
+    auto previous = cycleValue(value["begin_cycle"]);
+    const auto finalCycle = cycleValue(value["end_cycle"]);
+    bool endpoint = false;
+    for (size_t index = 0; index < lines.size(); ++index) {
+        auto event = parse(lines[index]);
+        fields(event, {"sequence", "kind", "cycle", "fields", "payload", "device", "related", "request", "raw"});
+        const auto& eventCycle = event["cycle"];
+        auto cycle = cycleValue(eventCycle);
+        require(text(event["sequence"], 20) == std::to_string(index + 1)
+            && previous <= cycle && cycle <= finalCycle, "pointer load event ordering rejected");
+        previous = cycle;
+        const auto& eventFields = event["fields"];
+        require(eventFields.IsObject(), "pointer load event fields rejected");
+        const auto& span = event["payload"]; fields(span, {"offset", "bytes"});
+        auto offset = number(span["offset"], payload.size());
+        auto count = number(span["bytes"], payload.size() - offset);
+        std::string data(payload, offset, count);
+        auto kind = text(event["kind"], 16);
+        require((index != 0 && index + 1 != lines.size()) || kind == "ram-context",
+            "pointer load boundary events missing");
+        ++kinds[kind];
+        if (kind == "ram-context") {
+            require(number(member(eventFields, "first"), 0x1ffffc) == capture.intervalStart
+                && number(member(eventFields, "byte_count"), 0x200000) == capture.intervalBytes
+                && number(member(eventFields, "setting_8mb"), 1) == 0,
+                "pointer load RAM mapping extent differs");
+            if (index == 0) {
+                require(text(member(eventFields, "phase"), 8) == "begin"
+                    && text(eventCycle, 20) == capture.beginCycle && data == image,
+                    "pointer load initial image missing");
+            } else if (index + 1 == lines.size()) {
+                require(!endpoint && text(member(eventFields, "phase"), 8) == "end"
+                    && text(eventCycle, 20) == capture.endCycle && data == image
+                    && number(member(eventFields, "pc"), UINT32_MAX) == capture.stopPc,
+                    "pointer load endpoint reconciliation differs");
+                endpoint = true;
+            } else {
+                require(data.empty(), "pointer load unexpected boundary image");
+            }
+        } else if (kind == "ram-write") {
+            auto backing = number(member(eventFields, "backing_offset"), 0x1fffffff);
+            require(!endpoint && count > 0 && count <= 16 && backing >= capture.intervalStart
+                && backing % 4 == 0 && backing - capture.intervalStart + count <= capture.intervalBytes
+                && number(member(eventFields, "byte_count"), 16) == count
+                && number(member(eventFields, "store_bytes"), 16) == count,
+                "pointer load committed write differs");
+            image.replace(size_t(backing - capture.intervalStart), size_t(count), data);
+            writes.push_back({uint32_t(backing), uint32_t(count)});
+        } else if (kind == "ram-instruction") {
+            auto backing = number(member(eventFields, "backing_offset"), 0x1fffffff);
+            auto pc = number(member(eventFields, "pc"), UINT32_MAX);
+            auto consumed = number(member(eventFields, "consumed_word"), UINT32_MAX);
+            auto marker = number(member(eventFields, "delay_slot"), 1);
+            require(backing >= capture.intervalStart && backing % 4 == 0
+                && backing - capture.intervalStart + 4 <= capture.intervalBytes
+                && (pc & 0x1fffffff) == backing
+                && consumed == number(member(eventFields, "backing_word"), UINT32_MAX)
+                && consumed == wordAt(size_t(backing - capture.intervalStart)) && marker <= 1,
+                "pointer load consumed instruction differs");
+            common::OriginalPointerLoadCapture::Occurrence occurrence;
+            // The recorded event sequence, which the check above pins to index + 1.
+            occurrence.sequence = index + 1;
+            occurrence.pc = pc;
+            occurrence.word = consumed;
+            occurrence.branchDelaySlot = marker == 1;
+            recorded.push_back(std::move(occurrence));
+        } else {
+            throw std::runtime_error("pointer load history has another event profile");
+        }
+    }
+    require(endpoint, "pointer load interval has no endpoint image");
+    require(number(member(metadata, "events"), 65536) == lines.size()
+        && lines.size() <= number(member(history, "event_limit"), 65536)
+        && payload.size() <= number(member(history, "byte_limit"), 8 << 20),
+        "pointer load event inventory differs");
+    const auto& metadataKinds = member(metadata, "kinds");
+    require(metadataKinds.IsObject() && metadataKinds.MemberCount() == kinds.size(),
+        "pointer load event inventory differs");
+    for (auto it = metadataKinds.MemberBegin(); it != metadataKinds.MemberEnd(); ++it) {
+        auto found = kinds.find(std::string(it->name.GetString(), it->name.GetStringLength()));
+        require(found != kinds.end() && number(it->value, 65536) == found->second,
+            "pointer load event inventory differs");
+    }
+    require(recorded.size() == capture.occurrences.size(),
+        "pointer load occurrence slice differs from the recording");
+    for (size_t index = 0; index < recorded.size(); ++index) {
+        const auto& claimed = capture.occurrences[index];
+        require(claimed.sequence == recorded[index].sequence && claimed.pc == recorded[index].pc,
+            "pointer load occurrence slice differs from the recording");
+        require(claimed.word == recorded[index].word, "observed-pointer-load-occurrence-word-differs");
+        require(claimed.branchDelaySlot == recorded[index].branchDelaySlot,
+            "observed-pointer-load-delay-marker-differs");
+    }
+    // A committed write may not land on a cell the admission rule can select, so the
+    // replayed boundary word stays the value the load observes. The candidate set is
+    // every locally based aligned word load, the superset of the admitted occurrences.
+    for (size_t index = 1; index < recorded.size(); ++index) {
+        uint32_t word = recorded[index].word, prefix = recorded[index - 1].word;
+        unsigned base = (word >> 21) & 31;
+        if ((word >> 26) != 0x23 || ((word >> 16) & 31) == 0 || !base || (prefix >> 26) != 15
+            || ((prefix >> 16) & 31) != base) continue;
+        uint32_t address = ((prefix & 0xffff) << 16) + uint32_t(int32_t(int16_t(word & 0xffff)));
+        auto physical = common::psxRamAddress(address);
+        if (address % 4 || !physical) continue;
+        auto cell = *physical & 0x1fffffff;
+        if (cell < capture.intervalStart || cell > capture.intervalStart + capture.intervalBytes - 4) continue;
+        for (const auto& write : writes)
+            require(write.physical + write.bytes <= cell || write.physical >= cell + 4,
+                "pointer load selected cell was rewritten inside the interval");
+    }
+    capture.initialImage.assign(payload.begin(), payload.begin() + capture.intervalBytes);
+    rapidjson::StringBuffer buffer; rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    value.Accept(writer);
+    capture.identity = hash(buffer.GetString(), buffer.GetSize());
+    return capture;
+}
+
 Request readRequest(const rapidjson::Document& doc, const std::string& workspace)
 {
     require(doc.IsObject() && doc.HasMember("schema"), "request schema missing");
     auto schema = text(doc["schema"]);
     bool copied = schema == "retdec118.native-request/v7";
-    bool observation = schema == "retdec118.native-request/v6";
+    bool loads = schema == "retdec118.native-request/v8";
+    bool observation = loads || schema == "retdec118.native-request/v6";
     bool overlays = copied || observation || schema == "retdec118.native-request/v5";
     bool forms = schema == "retdec118.native-request/v4" || (!copied && overlays && doc.HasMember("source_form"));
     bool bindings = overlays || forms || schema == "retdec118.native-request/v3";
     bool graph = bindings || schema == "retdec118.native-request/v2";
     if (copied) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "overlay_mounts", "copied_original"});
+    else if (loads && forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form", "overlay_mounts", "entry_observation", "pointer_load"});
+    else if (loads) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "overlay_mounts", "entry_observation", "pointer_load"});
     else if (observation && forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form", "overlay_mounts", "entry_observation"});
     else if (observation) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "overlay_mounts", "entry_observation"});
     else if (overlays && forms) fields(doc, {"schema", "operation", "request_id", "config_sha256", "member", "image", "problem_sha256", "callees", "image_catalog_sha256", "source_form", "overlay_mounts"});
@@ -389,6 +686,20 @@ Request readRequest(const rapidjson::Document& doc, const std::string& workspace
     if (bindings) request.catalogHash = digest(doc["image_catalog_sha256"]);
     request.operation = text(doc["operation"]);
     if (observation) request.entryObservation = readEntryObservation(doc["entry_observation"], workspace);
+    if (loads) request.pointerLoad = readPointerLoad(doc["pointer_load"], workspace);
+    if (request.pointerLoad) {
+        require(request.entryObservation
+            && request.pointerLoad->function == request.entryObservation->function
+            && request.pointerLoad->imageId == request.entryObservation->imageId
+            && request.pointerLoad->imageHash == request.entryObservation->imageHash
+            && request.pointerLoad->stateHash == request.entryObservation->stateHash
+            && request.pointerLoad->entryPc == request.entryObservation->pc,
+            "pointer load capture boundary differs from the observed entry");
+        // Matching RAM bytes do not prove the same pending-register and control boundary,
+        // so the authenticated CPU position must be the cycle the recording started at.
+        require(std::to_string(request.entryObservation->cycle) == request.pointerLoad->beginCycle,
+            "pointer load history does not start at the observed entry boundary");
+    }
     if (request.operation == "self-check") {
         require(!graph && doc["member"].IsNull() && doc["image"].IsNull(), "self-check cannot consume original input");
         return request;
@@ -953,12 +1264,14 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *core, int argc, co
         formsProtocol = doc.IsObject() && doc.HasMember("schema") && doc["schema"].IsString()
             && (std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v4"
                 || ((std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v5"
-                    || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v6") && doc.HasMember("source_form")));
+                    || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v6"
+                    || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v8") && doc.HasMember("source_form")));
         bindingsProtocol = formsProtocol || (doc.IsObject() && doc.HasMember("schema") && doc["schema"].IsString()
             && (std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v3"
                 || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v5"
                 || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v6"
-                || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v7"));
+                || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v7"
+                || std::string(doc["schema"].GetString(), doc["schema"].GetStringLength()) == "retdec118.native-request/v8"));
         request = readRequest(doc, workspace); requestReady = true;
         auto ambient = psxOverlaySnapshot(core);
         require(request.overlays || !ambient || ambient->mounts().empty(), "active overlays require an explicit v5 request");
@@ -1019,6 +1332,14 @@ RzCmdStatus DataAnalysisConsole::recoverOriginalRange(RzCore *core, int argc, co
                     char address[9]; snprintf(address, sizeof(address), "%08x", observation.pc);
                     require(observation.function == source->image->target + "@" + address, "observed entry function identity differs");
                     config.parameters.setOriginalEntryObservation(observation);
+                }
+                if (request.pointerLoad) {
+                    const auto& capture = *request.pointerLoad;
+                    auto source = context->resolve(capture.entryPc, 4);
+                    require(source && source->image->id == capture.imageId
+                        && source->image->fileHash == capture.imageHash,
+                        "pointer load original image ownership differs");
+                    config.parameters.setOriginalPointerLoad(capture);
                 }
                 config.parameters.setPsxMemoryContext(std::move(context));
             }
